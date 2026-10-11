@@ -1,0 +1,27 @@
+packages:
+  - apps/*
+  - packages/*
+
+# Los paquetes reales viven fuera del alcance de iCloud. Esta Mac tiene ~/Documents
+# sincronizada y iCloud vacía los archivos de node_modules para ahorrar espacio, lo que
+# rompe el entorno con errores que no parecen del código (ver docs/entorno.md).
+# macOS no sincroniza nada que termine en `.nosync`.
+virtualStoreDir: .pnpm.nosync
+
+# Dependencias autorizadas a ejecutar scripts de instalación (binarios nativos o motores).
+allowBuilds:
+  '@prisma/engines': true
+  argon2: true
+  esbuild: true
+  prisma: true
+  sharp: true
+  msgpackr-extract: true
+  unrs-resolver: true
+
+# pnpm 12 demora versiones recién publicadas; estas quedan fijadas a propósito.
+minimumReleaseAgeExclude:
+  - dotenv@18.0.4
+  - '@vitest/mocker@5.0.2'
+  - '@vitest/spy@5.0.2'
+  - vitest@5.0.2
+  - bullmq@6.3.9

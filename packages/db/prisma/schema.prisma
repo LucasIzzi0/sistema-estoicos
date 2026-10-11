@@ -1,0 +1,2338 @@
+// =============================================================================
+//  ESTOICOS · Esquema de base de datos (aprobado en la Fase 0)
+//  Prisma 7.x · PostgreSQL 16+
+//
+//  Convenciones
+//  - Código en inglés, comentarios en español. Tablas y columnas en snake_case.
+//  - IDs: UUID v7 (ordenables por fecha de creación, buen rendimiento de índice).
+//  - Dinero: BigInt en CENTAVOS de ARS, sufijo `Cents`. Nunca Float ni Decimal.
+//  - Porcentajes: puntos básicos (bps). 10000 = 100 %, 4500 = 45 %.
+//  - Fecha-hora: timestamptz (se guarda en UTC). La zona de negocio
+//    (America/Argentina/Buenos_Aires) se aplica en la lógica, nunca en la base.
+//    Fechas "de negocio" (día de caja, período de liquidación) usan `date`.
+//  - Ledgers (puntos, saldo a favor, stock, comisiones, auditoría, consentimientos,
+//    historial de turnos): SOLO INSERCIÓN. Un trigger impide UPDATE/DELETE.
+//  - Lo que Prisma no puede expresar vive en `extra.sql` (anti doble reserva,
+//    índices parciales, CHECKs, triggers) y se agrega a la migración inicial.
+//  - Tablas operativas llevan organization_id y branch_id; los clientes, sus
+//    puntos y su saldo a favor pertenecen a la organización.
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  moduleFormat    = "esm"
+  runtime         = "nodejs"
+  // Índices parciales nativos (preview desde Prisma 7.4). Evita escribirlos a mano en
+  // SQL, donde Prisma los borraría en la próxima migración por no conocerlos.
+  previewFeatures = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+  // La URL de conexión se define en prisma.config.ts (convención de Prisma 7).
+}
+
+// =============================================================================
+// 1. ORGANIZACIÓN (marca), CONFIGURACIÓN Y SUCURSALES
+// =============================================================================
+
+/// Marca. Hoy hay una sola; el modelo admite varias (franquicias o SaaS a futuro).
+model Organization {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  name      String
+  slug      String   @unique
+  legalName String?  @map("legal_name")
+  timezone  String   @default("America/Argentina/Buenos_Aires")
+  currency  String   @default("ARS") @db.Char(3)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  settings                 OrganizationSettings?
+  branches                 Branch[]
+  memberships              Membership[]
+  sessions                 Session[]
+  authCodes                AuthCode[]
+  customers                Customer[]
+  barbers                  Barber[]
+  serviceCategories        ServiceCategory[]
+  services                 Service[]
+  productCategories        ProductCategory[]
+  products                 Product[]
+  stockMovements           StockMovement[]
+  appointments             Appointment[]
+  sales                    Sale[]
+  payments                 Payment[]
+  creditEntries            CustomerCreditEntry[]
+  mpAccounts               MpAccount[]
+  mpPayments               MpPayment[]
+  webhookEvents            WebhookEvent[]
+  cashSessions             CashSession[]
+  expenseCategories        ExpenseCategory[]
+  expenses                 Expense[]
+  commissionEntries        CommissionEntry[]
+  commissionSettlements    CommissionSettlement[]
+  pointsEntries            PointsEntry[]
+  rewards                  Reward[]
+  rewardRedemptions        RewardRedemption[]
+  notificationTypeSettings NotificationTypeSetting[]
+  notifications            Notification[]
+  auditLogs                AuditLog[]
+  systemAlerts             SystemAlert[]
+
+  @@map("organizations")
+}
+
+/// Reglas de negocio configurables (1 a 1 con la organización). Columnas tipadas a
+/// propósito: cada regla queda visible, validada y con un valor por defecto.
+model OrganizationSettings {
+  organizationId String @id @map("organization_id") @db.Uuid
+
+  // --- Reservas ---
+  bookingSlotStepMinutes           Int     @default(15) @map("booking_slot_step_minutes")
+  bookingMinNoticeMinutes          Int     @default(60) @map("booking_min_notice_minutes")
+  bookingMaxDaysAhead              Int     @default(30) @map("booking_max_days_ahead")
+  bookingAllowAnyBarber            Boolean @default(true) @map("booking_allow_any_barber")
+  /// Máximo de turnos futuros activos por cliente (anti abuso de la reserva online).
+  bookingMaxActivePerCustomer      Int     @default(2) @map("booking_max_active_per_customer")
+  customerCanReschedule            Boolean @default(true) @map("customer_can_reschedule")
+  customerRescheduleMinNoticeHours Int     @default(3) @map("customer_reschedule_min_notice_hours")
+
+  // --- Señas ---
+  /// Minutos que el turno queda "pendiente de pago" antes de liberarse.
+  depositHoldMinutes       Int                 @default(15) @map("deposit_hold_minutes")
+  /// Si cancela con MÁS de estas horas de anticipación, la seña se reintegra o pasa a saldo.
+  depositRefundWindowHours Int                 @default(24) @map("deposit_refund_window_hours")
+  depositEarlyCancelPolicy DepositRefundPolicy @default(CUSTOMER_CREDIT) @map("deposit_early_cancel_policy")
+  /// Con esta cantidad de ausencias el cliente debe dejar seña siempre (null = desactivado).
+  noShowDepositThreshold   Int?                @map("no_show_deposit_threshold")
+  noShowDepositPercentBps  Int                 @default(5000) @map("no_show_deposit_percent_bps")
+
+  // --- Puntos ---
+  loyaltyEnabled            Boolean @default(true) @map("loyalty_enabled")
+  /// Regla general: X puntos (loyaltyPointsPerStep) por cada $Y (loyaltySpendStepCents).
+  loyaltyPointsPerStep      Int     @default(1) @map("loyalty_points_per_step")
+  loyaltySpendStepCents     BigInt  @default(100000) @map("loyalty_spend_step_cents")
+  /// Meses hasta que vencen los puntos (null = nunca vencen).
+  loyaltyPointsExpiryMonths Int?    @default(12) @map("loyalty_points_expiry_months")
+  loyaltyEarnOnProducts     Boolean @default(true) @map("loyalty_earn_on_products")
+
+  // --- Comisiones ---
+  /// Base de comisión cuando el servicio se canjeó con puntos (precio de lista o lo cobrado).
+  rewardCommissionBase    RewardCommissionBase @default(LIST_PRICE) @map("reward_commission_base")
+  defaultSettlementPeriod SettlementPeriod     @default(WEEKLY) @map("default_settlement_period")
+
+  // --- Caja y stock ---
+  requireOpenCashSession Boolean @default(true) @map("require_open_cash_session")
+  allowNegativeStock     Boolean @default(true) @map("allow_negative_stock")
+
+  // --- Mercado Pago ---
+  /// Vida de una orden Point antes de expirar (MP permite de 30 s a 3 h; su default es 15 min).
+  pointOrderTtlMinutes Int @default(10) @map("point_order_ttl_minutes")
+
+  // --- Notificaciones ---
+  whatsappEnabled           Boolean @default(false) @map("whatsapp_enabled")
+  /// Recordatorios: minutos antes del turno. Por defecto 24 h y 2 h.
+  reminderOffsetsMinutes    Int[]   @default([1440, 120]) @map("reminder_offsets_minutes")
+  reactivationAfterDays     Int     @default(35) @map("reactivation_after_days")
+  reactivationCooldownDays  Int     @default(30) @map("reactivation_cooldown_days")
+  reviewRequestDelayMinutes Int     @default(120) @map("review_request_delay_minutes")
+  reviewRequestCooldownDays Int     @default(90) @map("review_request_cooldown_days")
+  /// Franja sin mensajes de marketing, en minutos desde las 00:00 hora local (21:00 a 09:00).
+  marketingQuietStartMinute Int     @default(1260) @map("marketing_quiet_start_minute")
+  marketingQuietEndMinute   Int     @default(540) @map("marketing_quiet_end_minute")
+  emailSenderName           String? @map("email_sender_name")
+  replyToEmail              String? @map("reply_to_email")
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@map("organization_settings")
+}
+
+model Branch {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  organizationId  String   @map("organization_id") @db.Uuid
+  name            String
+  /// Se usa en la URL pública de reservas.
+  slug            String
+  address         String?
+  city            String?
+  province        String?
+  phone           String?
+  email           String?
+  timezone        String   @default("America/Argentina/Buenos_Aires")
+  /// Link para pedir reseña en Google después del servicio.
+  googleReviewUrl String?  @map("google_review_url")
+  bookingEnabled  Boolean  @default(true) @map("booking_enabled")
+  active          Boolean  @default(true)
+  /// Cuenta de Mercado Pago que cobra en esta sucursal (una franquicia futura puede tener la suya).
+  mpAccountId     String?  @map("mp_account_id") @db.Uuid
+  /// "Sucursal" (store) de Mercado Pago equivalente. Permite inferir la sucursal de un pago importado.
+  mpStoreId       String?  @map("mp_store_id")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization          Organization           @relation(fields: [organizationId], references: [id])
+  mpAccount             MpAccount?             @relation(fields: [mpAccountId], references: [id])
+  closures              BranchClosure[]
+  membershipBranches    MembershipBranch[]
+  barberBranches        BarberBranch[]
+  barberSchedules       BarberSchedule[]
+  barberTimeOffs        BarberTimeOff[]
+  branchServices        BranchService[]
+  branchProducts        BranchProduct[]
+  stockMovements        StockMovement[]
+  homeCustomers         Customer[]             @relation("CustomerHomeBranch")
+  customerNotes         CustomerNote[]
+  appointments          Appointment[]
+  sales                 Sale[]
+  payments              Payment[]
+  creditEntries         CustomerCreditEntry[]
+  mpTerminals           MpTerminal[]
+  mpOrders              MpOrder[]
+  mpPayments            MpPayment[]
+  cashSessions          CashSession[]
+  expenses              Expense[]
+  commissionEntries     CommissionEntry[]
+  commissionSettlements CommissionSettlement[]
+  pointsEntries         PointsEntry[]
+  rewardRedemptions     RewardRedemption[]
+  notifications         Notification[]
+  auditLogs             AuditLog[]
+
+  @@unique([organizationId, slug])
+  @@map("branches")
+}
+
+/// Cierres de toda la sucursal (feriados, reformas). Bloquean la agenda de todos los barberos.
+model BranchClosure {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  branchId    String   @map("branch_id") @db.Uuid
+  startsAt    DateTime @map("starts_at") @db.Timestamptz(3)
+  endsAt      DateTime @map("ends_at") @db.Timestamptz(3)
+  reason      String
+  createdById String?  @map("created_by_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  branch    Branch @relation(fields: [branchId], references: [id])
+  createdBy User?  @relation("BranchClosureCreatedBy", fields: [createdById], references: [id])
+
+  @@index([branchId, startsAt])
+  @@map("branch_closures")
+}
+
+/// Numeración legible por sucursal (ej. "Venta #1234"). Se incrementa con
+/// UPDATE ... RETURNING en la misma transacción que crea el registro.
+model SequenceCounter {
+  /// Ej.: "sale:<branchId>".
+  key       String   @id
+  value     Int      @default(0)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("sequence_counters")
+}
+
+// =============================================================================
+// 2. IDENTIDAD, ACCESO Y SESIONES
+// =============================================================================
+
+/// Usuario del staff (admin o barbero). Los clientes NO son User: son Customer.
+model User {
+  id                  String          @id @default(uuid(7)) @db.Uuid
+  /// Guardado en minúsculas.
+  email               String          @unique
+  name                String
+  phone               String?
+  /// argon2id. Null hasta que acepta la invitación y define su contraseña.
+  passwordHash        String?         @map("password_hash")
+  /// Preparado para segundo factor por código de email.
+  twoFactorMethod     TwoFactorMethod @default(NONE) @map("two_factor_method")
+  active              Boolean         @default(true)
+  emailVerifiedAt     DateTime?       @map("email_verified_at") @db.Timestamptz(3)
+  lastLoginAt         DateTime?       @map("last_login_at") @db.Timestamptz(3)
+  passwordChangedAt   DateTime?       @map("password_changed_at") @db.Timestamptz(3)
+  failedLoginAttempts Int             @default(0) @map("failed_login_attempts")
+  lockedUntil         DateTime?       @map("locked_until") @db.Timestamptz(3)
+  createdAt           DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  memberships Membership[]
+  sessions    Session[]
+  authCodes   AuthCode[]
+
+  // Relaciones inversas de "quién hizo qué" (trazabilidad).
+  customersCreated         Customer[]             @relation("CustomerCreatedBy")
+  customerNotes            CustomerNote[]
+  consentEventsRecorded    ConsentEvent[]
+  branchClosuresCreated    BranchClosure[]        @relation("BranchClosureCreatedBy")
+  timeOffsCreated          BarberTimeOff[]        @relation("TimeOffCreatedBy")
+  stockMovementsCreated    StockMovement[]
+  appointmentsCreated      Appointment[]          @relation("AppointmentCreatedBy")
+  appointmentEvents        AppointmentEvent[]
+  salesCreated             Sale[]                 @relation("SaleCreatedBy")
+  salesVoided              Sale[]                 @relation("SaleVoidedBy")
+  paymentsReceived         Payment[]
+  refundsCreated           Refund[]
+  creditEntriesCreated     CustomerCreditEntry[]
+  mpAccountsConnected      MpAccount[]
+  mpOrdersCreated          MpOrder[]
+  mpPaymentsReconciled     MpPayment[]
+  cashSessionsOpened       CashSession[]          @relation("CashSessionOpenedBy")
+  cashSessionsClosed       CashSession[]          @relation("CashSessionClosedBy")
+  cashMovementsCreated     CashMovement[]         @relation("CashMovementCreatedBy")
+  cashMovementsVoided      CashMovement[]         @relation("CashMovementVoidedBy")
+  expensesCreated          Expense[]              @relation("ExpenseCreatedBy")
+  expensesVoided           Expense[]              @relation("ExpenseVoidedBy")
+  commissionEntriesCreated CommissionEntry[]
+  settlementsCreated       CommissionSettlement[] @relation("SettlementCreatedBy")
+  settlementsPaid          CommissionSettlement[] @relation("SettlementPaidBy")
+  settlementsVoided        CommissionSettlement[] @relation("SettlementVoidedBy")
+  pointsEntriesCreated     PointsEntry[]
+  rewardRedemptionsCreated RewardRedemption[]
+  notifications            Notification[]
+  auditLogs                AuditLog[]
+  systemAlertsAcknowledged SystemAlert[]
+
+  @@map("users")
+}
+
+/// Pertenencia de un usuario a una organización, con su rol.
+/// ADMIN con allBranches=true = dueño. ADMIN sin allBranches = encargado de las
+/// sucursales listadas en MembershipBranch (no toca configuración global).
+/// RECEPTION = recepcionista de las sucursales listadas.
+model Membership {
+  id             String     @id @default(uuid(7)) @db.Uuid
+  userId         String     @map("user_id") @db.Uuid
+  organizationId String     @map("organization_id") @db.Uuid
+  role           MemberRole
+  allBranches    Boolean    @default(false) @map("all_branches")
+  active         Boolean    @default(true)
+  createdAt      DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user         User               @relation(fields: [userId], references: [id])
+  organization Organization       @relation(fields: [organizationId], references: [id])
+  branches     MembershipBranch[]
+  /// Reservado: hoy los barberos no tienen acceso (el vínculo queda por si en el futuro lo tienen).
+  barber       Barber?
+
+  @@unique([userId, organizationId])
+  @@map("memberships")
+}
+
+/// Sucursales a las que accede una membresía (cuando allBranches = false).
+model MembershipBranch {
+  membershipId String   @map("membership_id") @db.Uuid
+  branchId     String   @map("branch_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  membership Membership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  branch     Branch     @relation(fields: [branchId], references: [id])
+
+  @@id([membershipId, branchId])
+  @@map("membership_branches")
+}
+
+/// Sesión opaca (no JWT). En la cookie viaja un token aleatorio; acá solo su hash SHA-256.
+/// Permite cerrar sesiones al instante (logout, baja de un barbero, cambio de rol).
+model Session {
+  id                     String      @id @default(uuid(7)) @db.Uuid
+  tokenHash              String      @unique @map("token_hash")
+  kind                   SessionKind
+  organizationId         String      @map("organization_id") @db.Uuid
+  userId                 String?     @map("user_id") @db.Uuid
+  customerId             String?     @map("customer_id") @db.Uuid
+  expiresAt              DateTime    @map("expires_at") @db.Timestamptz(3)
+  lastSeenAt             DateTime    @default(now()) @map("last_seen_at") @db.Timestamptz(3)
+  /// Para cuando se active el segundo factor del staff.
+  secondFactorVerifiedAt DateTime?   @map("second_factor_verified_at") @db.Timestamptz(3)
+  ipAddress              String?     @map("ip_address")
+  userAgent              String?     @map("user_agent")
+  revokedAt              DateTime?   @map("revoked_at") @db.Timestamptz(3)
+  createdAt              DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  user         User?        @relation(fields: [userId], references: [id])
+  customer     Customer?    @relation(fields: [customerId], references: [id])
+
+  @@index([userId])
+  @@index([customerId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+/// Códigos de un solo uso: login de clientes (6 dígitos), 2FA del staff, invitaciones y
+/// recuperación de contraseña. Se guarda solo el HMAC del código. Vence, tiene
+/// intentos máximos y pedir uno nuevo invalida los anteriores.
+model AuthCode {
+  id             String          @id @default(uuid(7)) @db.Uuid
+  purpose        AuthCodePurpose
+  organizationId String?         @map("organization_id") @db.Uuid
+  /// Normalizado en minúsculas.
+  email          String
+  userId         String?         @map("user_id") @db.Uuid
+  customerId     String?         @map("customer_id") @db.Uuid
+  codeHash       String          @map("code_hash")
+  expiresAt      DateTime        @map("expires_at") @db.Timestamptz(3)
+  attempts       Int             @default(0)
+  maxAttempts    Int             @default(5) @map("max_attempts")
+  consumedAt     DateTime?       @map("consumed_at") @db.Timestamptz(3)
+  invalidatedAt  DateTime?       @map("invalidated_at") @db.Timestamptz(3)
+  requestIp      String?         @map("request_ip")
+  userAgent      String?         @map("user_agent")
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization? @relation(fields: [organizationId], references: [id])
+  user         User?         @relation(fields: [userId], references: [id])
+  customer     Customer?     @relation(fields: [customerId], references: [id])
+
+  @@index([email, purpose, createdAt])
+  @@map("auth_codes")
+}
+
+// =============================================================================
+// 3. CLIENTES (pertenecen a la organización)
+// =============================================================================
+
+model Customer {
+  id                    String              @id @default(uuid(7)) @db.Uuid
+  organizationId        String              @map("organization_id") @db.Uuid
+  firstName             String              @map("first_name")
+  lastName              String              @map("last_name")
+  /// Minúsculas. Es la llave de acceso al portal (código por email). Opcional en el local.
+  email                 String?
+  emailVerifiedAt       DateTime?           @map("email_verified_at") @db.Timestamptz(3)
+  /// Formato E.164 (+549...). No es único: padres e hijos pueden compartir teléfono.
+  phone                 String?
+  /// Identificador de usuario de WhatsApp por empresa (BSUID). Desde 2026 Meta puede
+  /// omitir el número (wa_id) en los webhooks; este id sirve para reconocer al cliente.
+  whatsappUserId        String?             @map("whatsapp_user_id")
+  /// Meta respondió que el número no tiene WhatsApp: se va directo a email hasta que cambie el teléfono.
+  whatsappUnreachableAt DateTime?           @map("whatsapp_unreachable_at") @db.Timestamptz(3)
+  /// Rebote permanente o denuncia de spam: no se le vuelve a enviar email hasta corregirlo.
+  emailBouncedAt        DateTime?           @map("email_bounced_at") @db.Timestamptz(3)
+  /// Solo dígitos. Opcional y único por organización. NUNCA se usa para autenticar.
+  dni                   String?
+  birthDate             DateTime?           @map("birth_date") @db.Date
+  preferredChannel      NotificationChannel @default(WHATSAPP) @map("preferred_channel")
+  source                CustomerSource
+  /// Sucursal habitual (informativa; el cliente puede ir a cualquiera).
+  homeBranchId          String?             @map("home_branch_id") @db.Uuid
+  /// Primera y última visita pagada. Sirven para "nuevos vs recurrentes", reactivación y reportes.
+  firstVisitAt          DateTime?           @map("first_visit_at") @db.Timestamptz(3)
+  lastVisitAt           DateTime?           @map("last_visit_at") @db.Timestamptz(3)
+  bookingBlockedAt      DateTime?           @map("booking_blocked_at") @db.Timestamptz(3)
+  bookingBlockNote      String?             @map("booking_block_note")
+  /// Texto normalizado para búsqueda (sin acentos, minúsculas): nombre, email, dígitos del celular, DNI.
+  searchText            String              @default("") @map("search_text")
+  /// Baja por pedido del titular (Ley 25.326): se borran datos personales y se conserva el historial contable.
+  anonymizedAt          DateTime?           @map("anonymized_at") @db.Timestamptz(3)
+  /// Registro duplicado fusionado en otro: sus turnos y notas pasaron a ese cliente y este queda
+  /// sin datos personales, solo como referencia del historial inmutable (consentimientos, eventos).
+  mergedIntoId          String?             @map("merged_into_id") @db.Uuid
+  mergedAt              DateTime?           @map("merged_at") @db.Timestamptz(3)
+  createdById           String?             @map("created_by_id") @db.Uuid
+  createdAt             DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization      Organization          @relation(fields: [organizationId], references: [id])
+  homeBranch        Branch?               @relation("CustomerHomeBranch", fields: [homeBranchId], references: [id])
+  createdBy         User?                 @relation("CustomerCreatedBy", fields: [createdById], references: [id])
+  mergedInto        Customer?             @relation("CustomerMerge", fields: [mergedIntoId], references: [id])
+  mergedFrom        Customer[]            @relation("CustomerMerge")
+  sessions          Session[]
+  authCodes         AuthCode[]
+  notes             CustomerNote[]
+  consents          CustomerConsent[]
+  consentEvents     ConsentEvent[]
+  appointments      Appointment[]
+  appointmentEvents AppointmentEvent[]
+  sales             Sale[]
+  payments          Payment[]
+  creditEntries     CustomerCreditEntry[]
+  pointsEntries     PointsEntry[]
+  rewardRedemptions RewardRedemption[]
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+
+  @@unique([organizationId, email])
+  @@unique([organizationId, dni])
+  @@unique([organizationId, whatsappUserId])
+  @@index([organizationId, phone])
+  @@index([searchText(ops: raw("gin_trgm_ops"))], type: Gin, map: "customers_search_trgm")
+  @@index([organizationId, lastName, firstName])
+  @@index([organizationId, lastVisitAt])
+  @@map("customers")
+}
+
+/// Notas del staff sobre el cliente (ej. "degradé en 1, no le gusta la navaja").
+model CustomerNote {
+  id         String    @id @default(uuid(7)) @db.Uuid
+  customerId String    @map("customer_id") @db.Uuid
+  authorId   String    @map("author_id") @db.Uuid
+  branchId   String?   @map("branch_id") @db.Uuid
+  body       String
+  pinned     Boolean   @default(false)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt  DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  customer Customer @relation(fields: [customerId], references: [id])
+  author   User     @relation(fields: [authorId], references: [id])
+  branch   Branch?  @relation(fields: [branchId], references: [id])
+
+  @@index([customerId, createdAt])
+  @@map("customer_notes")
+}
+
+/// Estado VIGENTE del consentimiento por canal y alcance (consulta rápida al enviar).
+model CustomerConsent {
+  customerId String              @map("customer_id") @db.Uuid
+  channel    NotificationChannel
+  scope      ConsentScope
+  granted    Boolean
+  updatedAt  DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  @@id([customerId, channel, scope])
+  @@map("customer_consents")
+}
+
+/// Historial INMUTABLE de consentimientos (evidencia: quién, cuándo, cómo y qué texto aceptó).
+model ConsentEvent {
+  id            String              @id @default(uuid(7)) @db.Uuid
+  customerId    String              @map("customer_id") @db.Uuid
+  channel       NotificationChannel
+  scope         ConsentScope
+  granted       Boolean
+  source        ConsentSource
+  /// Versión del texto de consentimiento mostrado.
+  policyVersion String              @map("policy_version")
+  recordedById  String?             @map("recorded_by_id") @db.Uuid
+  ipAddress     String?             @map("ip_address")
+  userAgent     String?             @map("user_agent")
+  occurredAt    DateTime            @default(now()) @map("occurred_at") @db.Timestamptz(3)
+
+  customer   Customer @relation(fields: [customerId], references: [id])
+  recordedBy User?    @relation(fields: [recordedById], references: [id])
+
+  @@index([customerId, occurredAt])
+  @@map("consent_events")
+}
+
+// =============================================================================
+// 4. BARBEROS, HORARIOS Y BLOQUEOS
+// =============================================================================
+
+/// Perfil profesional de quien atiende. Puede tener o no usuario de acceso.
+model Barber {
+  id                   String            @id @default(uuid(7)) @db.Uuid
+  organizationId       String            @map("organization_id") @db.Uuid
+  /// Null = barbero sin acceso al sistema (el admin maneja su agenda).
+  membershipId         String?           @unique @map("membership_id") @db.Uuid
+  displayName          String            @map("display_name")
+  photoUrl             String?           @map("photo_url")
+  /// Color de su columna en la agenda.
+  color                String?
+  bio                  String?
+  active               Boolean           @default(true)
+  acceptsOnlineBooking Boolean           @default(true) @map("accepts_online_booking")
+  /// Comisión general sobre servicios, productos y propinas (bps).
+  serviceCommissionBps Int               @default(0) @map("service_commission_bps")
+  productCommissionBps Int               @default(0) @map("product_commission_bps")
+  /// Propinas: quedan para la casa (P22), así que por defecto el barbero no cobra comisión sobre ellas.
+  tipCommissionBps     Int               @default(0) @map("tip_commission_bps")
+  /// Null = usa el período por defecto de la organización.
+  settlementPeriod     SettlementPeriod? @map("settlement_period")
+  sortOrder            Int               @default(0) @map("sort_order")
+  createdAt            DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization      Organization           @relation(fields: [organizationId], references: [id])
+  membership        Membership?            @relation(fields: [membershipId], references: [id])
+  branches          BarberBranch[]
+  services          BarberService[]
+  schedules         BarberSchedule[]
+  timeOffs          BarberTimeOff[]
+  appointments      Appointment[]
+  saleItems         SaleItem[]
+  commissionEntries CommissionEntry[]
+  settlements       CommissionSettlement[]
+
+  @@index([organizationId, active])
+  @@map("barbers")
+}
+
+/// En qué sucursales trabaja cada barbero.
+model BarberBranch {
+  barberId  String   @map("barber_id") @db.Uuid
+  branchId  String   @map("branch_id") @db.Uuid
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  barber Barber @relation(fields: [barberId], references: [id])
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@id([barberId, branchId])
+  @@map("barber_branches")
+}
+
+/// Servicios que realiza cada barbero, con overrides opcionales.
+model BarberService {
+  barberId              String  @map("barber_id") @db.Uuid
+  serviceId             String  @map("service_id") @db.Uuid
+  /// Si este barbero tarda distinto que la duración estándar.
+  durationMinOverride   Int?    @map("duration_min_override")
+  /// Override de comisión para este barbero y este servicio (prioridad máxima).
+  commissionBpsOverride Int?    @map("commission_bps_override")
+  active                Boolean @default(true)
+
+  barber  Barber  @relation(fields: [barberId], references: [id])
+  service Service @relation(fields: [serviceId], references: [id])
+
+  @@id([barberId, serviceId])
+  @@map("barber_services")
+}
+
+/// Horario semanal por sucursal. Varios tramos por día permiten turno partido
+/// (el almuerzo fijo es el hueco entre tramos). Hora local de la sucursal.
+model BarberSchedule {
+  id          String    @id @default(uuid(7)) @db.Uuid
+  barberId    String    @map("barber_id") @db.Uuid
+  branchId    String    @map("branch_id") @db.Uuid
+  /// 1 = lunes … 7 = domingo (ISO 8601).
+  weekday     Int
+  /// Minutos desde las 00:00 (600 = 10:00).
+  startMinute Int       @map("start_minute")
+  endMinute   Int       @map("end_minute")
+  /// Vigencia opcional para cambios de horario programados.
+  validFrom   DateTime? @map("valid_from") @db.Date
+  validUntil  DateTime? @map("valid_until") @db.Date
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  barber Barber @relation(fields: [barberId], references: [id])
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@index([barberId, weekday])
+  @@index([branchId, weekday])
+  @@map("barber_schedules")
+}
+
+/// Bloqueos puntuales: vacaciones, trámites, un almuerzo distinto, enfermedad.
+model BarberTimeOff {
+  id          String      @id @default(uuid(7)) @db.Uuid
+  barberId    String      @map("barber_id") @db.Uuid
+  /// Null = aplica a todas las sucursales.
+  branchId    String?     @map("branch_id") @db.Uuid
+  type        TimeOffType
+  startsAt    DateTime    @map("starts_at") @db.Timestamptz(3)
+  endsAt      DateTime    @map("ends_at") @db.Timestamptz(3)
+  note        String?
+  createdById String?     @map("created_by_id") @db.Uuid
+  createdAt   DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  barber    Barber  @relation(fields: [barberId], references: [id])
+  branch    Branch? @relation(fields: [branchId], references: [id])
+  createdBy User?   @relation("TimeOffCreatedBy", fields: [createdById], references: [id])
+
+  @@index([barberId, startsAt])
+  @@map("barber_time_offs")
+}
+
+// =============================================================================
+// 5. CATÁLOGO: SERVICIOS Y PRODUCTOS
+// =============================================================================
+
+model ServiceCategory {
+  id             String  @id @default(uuid(7)) @db.Uuid
+  organizationId String  @map("organization_id") @db.Uuid
+  name           String
+  sortOrder      Int     @default(0) @map("sort_order")
+  active         Boolean @default(true)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  services     Service[]
+
+  @@unique([organizationId, name])
+  @@map("service_categories")
+}
+
+/// Servicio (corte, barba, combo). Un combo es un servicio más, con su duración y precio.
+model Service {
+  id                    String      @id @default(uuid(7)) @db.Uuid
+  organizationId        String      @map("organization_id") @db.Uuid
+  categoryId            String?     @map("category_id") @db.Uuid
+  name                  String
+  description           String?
+  /// Duración estándar en minutos (incluye limpieza si se desea).
+  durationMin           Int         @map("duration_min")
+  basePriceCents        BigInt      @map("base_price_cents")
+  active                Boolean     @default(true)
+  /// Si aparece en la reserva online (algunos servicios pueden ser solo en el local).
+  onlineBookable        Boolean     @default(true) @map("online_bookable")
+  /// Override de la regla general de puntos: puntos fijos por unidad.
+  pointsOverride        Int?        @map("points_override")
+  /// Override de comisión para todos los barberos (BarberService tiene prioridad).
+  commissionBpsOverride Int?        @map("commission_bps_override")
+  depositMode           DepositMode @default(NONE) @map("deposit_mode")
+  depositFixedCents     BigInt?     @map("deposit_fixed_cents")
+  depositPercentBps     Int?        @map("deposit_percent_bps")
+  sortOrder             Int         @default(0) @map("sort_order")
+  archivedAt            DateTime?   @map("archived_at") @db.Timestamptz(3)
+  createdAt             DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization        Organization         @relation(fields: [organizationId], references: [id])
+  category            ServiceCategory?     @relation(fields: [categoryId], references: [id])
+  branchServices      BranchService[]
+  barberServices      BarberService[]
+  appointmentServices AppointmentService[]
+  saleItems           SaleItem[]
+  rewards             Reward[]
+
+  @@index([organizationId, active])
+  @@map("services")
+}
+
+/// Servicio ofrecido en una sucursal, con precio propio opcional.
+model BranchService {
+  branchId           String   @map("branch_id") @db.Uuid
+  serviceId          String   @map("service_id") @db.Uuid
+  /// Null = usa el precio base del servicio.
+  priceCentsOverride BigInt?  @map("price_cents_override")
+  active             Boolean  @default(true)
+  updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  branch  Branch  @relation(fields: [branchId], references: [id])
+  service Service @relation(fields: [serviceId], references: [id])
+
+  @@id([branchId, serviceId])
+  @@map("branch_services")
+}
+
+model ProductCategory {
+  id             String  @id @default(uuid(7)) @db.Uuid
+  organizationId String  @map("organization_id") @db.Uuid
+  name           String
+  sortOrder      Int     @default(0) @map("sort_order")
+  active         Boolean @default(true)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  products     Product[]
+
+  @@unique([organizationId, name])
+  @@map("product_categories")
+}
+
+model Product {
+  id                    String    @id @default(uuid(7)) @db.Uuid
+  organizationId        String    @map("organization_id") @db.Uuid
+  categoryId            String?   @map("category_id") @db.Uuid
+  name                  String
+  description           String?
+  sku                   String?
+  barcode               String?
+  basePriceCents        BigInt    @map("base_price_cents")
+  /// Costo de reposición (para margen en reportes).
+  costCents             BigInt?   @map("cost_cents")
+  trackStock            Boolean   @default(true) @map("track_stock")
+  active                Boolean   @default(true)
+  pointsOverride        Int?      @map("points_override")
+  commissionBpsOverride Int?      @map("commission_bps_override")
+  archivedAt            DateTime? @map("archived_at") @db.Timestamptz(3)
+  createdAt             DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization   Organization     @relation(fields: [organizationId], references: [id])
+  category       ProductCategory? @relation(fields: [categoryId], references: [id])
+  branchProducts BranchProduct[]
+  stockMovements StockMovement[]
+  saleItems      SaleItem[]
+  rewards        Reward[]
+
+  @@unique([organizationId, sku])
+  @@unique([organizationId, barcode])
+  @@map("products")
+}
+
+/// Producto en una sucursal: precio propio opcional y stock actual.
+/// stockOnHand es una proyección cacheada; la verdad está en StockMovement y se
+/// actualizan juntos en la misma transacción.
+model BranchProduct {
+  branchId           String   @map("branch_id") @db.Uuid
+  productId          String   @map("product_id") @db.Uuid
+  priceCentsOverride BigInt?  @map("price_cents_override")
+  stockOnHand        Int      @default(0) @map("stock_on_hand")
+  /// Umbral de alerta de stock bajo (null = sin alerta).
+  minStock           Int?     @map("min_stock")
+  active             Boolean  @default(true)
+  updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  branch  Branch  @relation(fields: [branchId], references: [id])
+  product Product @relation(fields: [productId], references: [id])
+
+  @@id([branchId, productId])
+  @@map("branch_products")
+}
+
+/// Ledger INMUTABLE de movimientos de stock. quantity con signo (+ entra, − sale).
+model StockMovement {
+  id             String            @id @default(uuid(7)) @db.Uuid
+  organizationId String            @map("organization_id") @db.Uuid
+  branchId       String            @map("branch_id") @db.Uuid
+  productId      String            @map("product_id") @db.Uuid
+  type           StockMovementType
+  quantity       Int
+  /// Stock resultante después del movimiento (para el historial).
+  balanceAfter   Int               @map("balance_after")
+  unitCostCents  BigInt?           @map("unit_cost_cents")
+  /// Obligatorio en ajustes manuales (CHECK en extra.sql).
+  reason         String?
+  saleItemId     String?           @map("sale_item_id") @db.Uuid
+  createdById    String?           @map("created_by_id") @db.Uuid
+  createdAt      DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  branch       Branch       @relation(fields: [branchId], references: [id])
+  product      Product      @relation(fields: [productId], references: [id])
+  saleItem     SaleItem?    @relation(fields: [saleItemId], references: [id])
+  createdBy    User?        @relation(fields: [createdById], references: [id])
+
+  @@index([branchId, productId, createdAt])
+  @@map("stock_movements")
+}
+
+// =============================================================================
+// 6. AGENDA Y TURNOS
+// =============================================================================
+
+/// Turno. La doble reserva la impide la base: EXCLUDE USING gist sobre
+/// (barber_id, rango [starts_at, ends_at)) para estados activos (ver extra.sql).
+model Appointment {
+  id                   String              @id @default(uuid(7)) @db.Uuid
+  organizationId       String              @map("organization_id") @db.Uuid
+  branchId             String              @map("branch_id") @db.Uuid
+  barberId             String              @map("barber_id") @db.Uuid
+  /// Opcional solo para atenciones sin turno (WALK_IN) de clientes que no se registran.
+  customerId           String?             @map("customer_id") @db.Uuid
+  status               AppointmentStatus
+  source               AppointmentSource
+  startsAt             DateTime            @map("starts_at") @db.Timestamptz(3)
+  endsAt               DateTime            @map("ends_at") @db.Timestamptz(3)
+  /// El cliente eligió "cualquier barbero" y el sistema asignó uno.
+  anyBarberRequested   Boolean             @default(false) @map("any_barber_requested")
+  customerNotes        String?             @map("customer_notes")
+  internalNotes        String?             @map("internal_notes")
+  /// Precio total reservado (suma de los servicios al momento de reservar).
+  bookedTotalCents     BigInt              @default(0) @map("booked_total_cents")
+  depositRequiredCents BigInt              @default(0) @map("deposit_required_cents")
+  depositStatus        DepositStatus       @default(NOT_REQUIRED) @map("deposit_status")
+  /// Hasta cuándo se retiene el horario esperando el pago de la seña.
+  holdExpiresAt        DateTime?           @map("hold_expires_at") @db.Timestamptz(3)
+  confirmedAt          DateTime?           @map("confirmed_at") @db.Timestamptz(3)
+  confirmedVia         ConfirmationSource? @map("confirmed_via")
+  startedAt            DateTime?           @map("started_at") @db.Timestamptz(3)
+  completedAt          DateTime?           @map("completed_at") @db.Timestamptz(3)
+  canceledAt           DateTime?           @map("canceled_at") @db.Timestamptz(3)
+  canceledBy           ActorType?          @map("canceled_by")
+  cancelReason         CancelReason?       @map("cancel_reason")
+  cancelNote           String?             @map("cancel_note")
+  noShowAt             DateTime?           @map("no_show_at") @db.Timestamptz(3)
+  createdById          String?             @map("created_by_id") @db.Uuid
+  createdAt            DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization  Organization         @relation(fields: [organizationId], references: [id])
+  branch        Branch               @relation(fields: [branchId], references: [id])
+  barber        Barber               @relation(fields: [barberId], references: [id])
+  customer      Customer?            @relation(fields: [customerId], references: [id])
+  createdBy     User?                @relation("AppointmentCreatedBy", fields: [createdById], references: [id])
+  services      AppointmentService[]
+  events        AppointmentEvent[]
+  sale          Sale?
+  payments      Payment[]
+  mpPreferences MpPreference[]
+  notifications Notification[]
+
+  @@index([branchId, startsAt])
+  @@index([barberId, startsAt])
+  @@index([customerId, startsAt])
+  @@index([status, holdExpiresAt])
+  @@map("appointments")
+}
+
+/// Servicios de un turno, con precio y duración "congelados" al reservar.
+model AppointmentService {
+  id            String @id @default(uuid(7)) @db.Uuid
+  appointmentId String @map("appointment_id") @db.Uuid
+  serviceId     String @map("service_id") @db.Uuid
+  position      Int
+  durationMin   Int    @map("duration_min")
+  priceCents    BigInt @map("price_cents")
+  depositCents  BigInt @default(0) @map("deposit_cents")
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  service     Service     @relation(fields: [serviceId], references: [id])
+  saleItem    SaleItem?
+
+  @@unique([appointmentId, position])
+  @@map("appointment_services")
+}
+
+/// Historial INMUTABLE del turno: creación, cambios de estado, movidas, reasignaciones.
+model AppointmentEvent {
+  id               String               @id @default(uuid(7)) @db.Uuid
+  appointmentId    String               @map("appointment_id") @db.Uuid
+  type             AppointmentEventType
+  fromStatus       AppointmentStatus?   @map("from_status")
+  toStatus         AppointmentStatus?   @map("to_status")
+  previousStartsAt DateTime?            @map("previous_starts_at") @db.Timestamptz(3)
+  previousBarberId String?              @map("previous_barber_id") @db.Uuid
+  actorType        ActorType            @map("actor_type")
+  actorUserId      String?              @map("actor_user_id") @db.Uuid
+  actorCustomerId  String?              @map("actor_customer_id") @db.Uuid
+  note             String?
+  createdAt        DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  appointment   Appointment @relation(fields: [appointmentId], references: [id])
+  actorUser     User?       @relation(fields: [actorUserId], references: [id])
+  actorCustomer Customer?   @relation(fields: [actorCustomerId], references: [id])
+
+  @@index([appointmentId, createdAt])
+  @@map("appointment_events")
+}
+
+// =============================================================================
+// 7. VENTAS, COBROS, REINTEGROS Y SALDO A FAVOR
+// =============================================================================
+
+/// Venta (con o sin turno). Punto único de consistencia: al pasar a PAID, en UNA
+/// transacción se generan comisiones, puntos, movimientos de stock y última visita.
+model Sale {
+  id             String     @id @default(uuid(7)) @db.Uuid
+  organizationId String     @map("organization_id") @db.Uuid
+  branchId       String     @map("branch_id") @db.Uuid
+  /// Número legible por sucursal (SequenceCounter).
+  number         Int
+  customerId     String?    @map("customer_id") @db.Uuid
+  appointmentId  String?    @unique @map("appointment_id") @db.Uuid
+  status         SaleStatus @default(OPEN)
+  subtotalCents  BigInt     @default(0) @map("subtotal_cents")
+  discountCents  BigInt     @default(0) @map("discount_cents")
+  totalCents     BigInt     @default(0) @map("total_cents")
+  /// Suma de cobros aprobados (se recalcula en la transacción de cada cobro).
+  paidCents      BigInt     @default(0) @map("paid_cents")
+  refundedCents  BigInt     @default(0) @map("refunded_cents")
+  notes          String?
+  createdById    String     @map("created_by_id") @db.Uuid
+  paidAt         DateTime?  @map("paid_at") @db.Timestamptz(3)
+  voidedAt       DateTime?  @map("voided_at") @db.Timestamptz(3)
+  voidedById     String?    @map("voided_by_id") @db.Uuid
+  voidReason     String?    @map("void_reason")
+  createdAt      DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization      Organization          @relation(fields: [organizationId], references: [id])
+  branch            Branch                @relation(fields: [branchId], references: [id])
+  customer          Customer?             @relation(fields: [customerId], references: [id])
+  appointment       Appointment?          @relation(fields: [appointmentId], references: [id])
+  createdBy         User                  @relation("SaleCreatedBy", fields: [createdById], references: [id])
+  voidedBy          User?                 @relation("SaleVoidedBy", fields: [voidedById], references: [id])
+  items             SaleItem[]
+  payments          Payment[]
+  mpOrders          MpOrder[]
+  commissionEntries CommissionEntry[]
+  pointsEntries     PointsEntry[]
+  creditEntries     CustomerCreditEntry[]
+  rewardRedemptions RewardRedemption[]
+  notifications     Notification[]
+
+  @@unique([branchId, number])
+  @@index([organizationId, branchId, paidAt])
+  @@index([customerId, createdAt])
+  @@index([status])
+  @@map("sales")
+}
+
+/// Línea de venta. Precio y descripción congelados. barberId = quién hizo el servicio
+/// (o quién vendió el producto) y define la comisión.
+model SaleItem {
+  id                   String       @id @default(uuid(7)) @db.Uuid
+  saleId               String       @map("sale_id") @db.Uuid
+  type                 SaleItemType
+  serviceId            String?      @map("service_id") @db.Uuid
+  productId            String?      @map("product_id") @db.Uuid
+  barberId             String?      @map("barber_id") @db.Uuid
+  appointmentServiceId String?      @unique @map("appointment_service_id") @db.Uuid
+  description          String
+  quantity             Int          @default(1)
+  unitPriceCents       BigInt       @map("unit_price_cents")
+  /// Descuento de la línea (manual o por recompensa canjeada).
+  discountCents        BigInt       @default(0) @map("discount_cents")
+  /// quantity × unitPrice − discount (CHECK en extra.sql).
+  totalCents           BigInt       @map("total_cents")
+  discountReason       String?      @map("discount_reason")
+  createdAt            DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  sale               Sale                @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  service            Service?            @relation(fields: [serviceId], references: [id])
+  product            Product?            @relation(fields: [productId], references: [id])
+  barber             Barber?             @relation(fields: [barberId], references: [id])
+  appointmentService AppointmentService? @relation(fields: [appointmentServiceId], references: [id])
+  stockMovements     StockMovement[]
+  commissionEntries  CommissionEntry[]
+  rewardRedemption   RewardRedemption?
+
+  @@index([saleId])
+  @@index([barberId])
+  @@map("sale_items")
+}
+
+/// Cobro: todo dinero que entra (o intenta entrar). Una venta puede tener varios
+/// (pago dividido). La seña online es un cobro del turno que luego se aplica a la venta.
+model Payment {
+  id             String         @id @default(uuid(7)) @db.Uuid
+  organizationId String         @map("organization_id") @db.Uuid
+  branchId       String         @map("branch_id") @db.Uuid
+  purpose        PaymentPurpose
+  method         PaymentMethod
+  status         PaymentStatus
+  amountCents    BigInt         @map("amount_cents")
+  refundedCents  BigInt         @default(0) @map("refunded_cents")
+  saleId         String?        @map("sale_id") @db.Uuid
+  /// Para señas: el turno al que pertenece.
+  appointmentId  String?        @map("appointment_id") @db.Uuid
+  customerId     String?        @map("customer_id") @db.Uuid
+  /// Caja en la que se registró (null para cobros online como la seña).
+  cashSessionId  String?        @map("cash_session_id") @db.Uuid
+  /// Pago de Mercado Pago que respalda este cobro (1 a 1: imposible usarlo dos veces).
+  mpPaymentId    String?        @unique @map("mp_payment_id") @db.Uuid
+  /// Nº de operación o comprobante (transferencias).
+  reference      String?
+  /// Obligatoria para "otro ingreso".
+  description    String?
+  receivedById   String?        @map("received_by_id") @db.Uuid
+  approvedAt     DateTime?      @map("approved_at") @db.Timestamptz(3)
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization  Organization          @relation(fields: [organizationId], references: [id])
+  branch        Branch                @relation(fields: [branchId], references: [id])
+  sale          Sale?                 @relation(fields: [saleId], references: [id])
+  appointment   Appointment?          @relation(fields: [appointmentId], references: [id])
+  customer      Customer?             @relation(fields: [customerId], references: [id])
+  cashSession   CashSession?          @relation(fields: [cashSessionId], references: [id])
+  mpPayment     MpPayment?            @relation(fields: [mpPaymentId], references: [id])
+  receivedBy    User?                 @relation(fields: [receivedById], references: [id])
+  mpOrder       MpOrder?
+  mpPreference  MpPreference?
+  refunds       Refund[]
+  creditEntries CustomerCreditEntry[]
+
+  @@index([branchId, createdAt])
+  @@index([saleId])
+  @@index([appointmentId])
+  @@index([cashSessionId])
+  @@index([status])
+  @@map("payments")
+}
+
+/// Reintegro de un cobro: al medio original (efectivo, Mercado Pago) o a saldo a favor.
+model Refund {
+  id            String            @id @default(uuid(7)) @db.Uuid
+  paymentId     String            @map("payment_id") @db.Uuid
+  amountCents   BigInt            @map("amount_cents")
+  destination   RefundDestination
+  status        RefundStatus      @default(PENDING)
+  reason        String
+  /// Id del reintegro en Mercado Pago (evita duplicados).
+  mpRefundId    String?           @unique @map("mp_refund_id")
+  /// Si se devolvió efectivo de la caja.
+  cashSessionId String?           @map("cash_session_id") @db.Uuid
+  failureReason String?           @map("failure_reason")
+  createdById   String?           @map("created_by_id") @db.Uuid
+  createdAt     DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  processedAt   DateTime?         @map("processed_at") @db.Timestamptz(3)
+
+  payment       Payment               @relation(fields: [paymentId], references: [id])
+  cashSession   CashSession?          @relation(fields: [cashSessionId], references: [id])
+  createdBy     User?                 @relation(fields: [createdById], references: [id])
+  creditEntries CustomerCreditEntry[]
+
+  @@index([paymentId])
+  @@map("refunds")
+}
+
+/// Ledger INMUTABLE de saldo a favor del cliente (en dinero). Saldo = SUM(amount_cents).
+model CustomerCreditEntry {
+  id             String          @id @default(uuid(7)) @db.Uuid
+  organizationId String          @map("organization_id") @db.Uuid
+  customerId     String          @map("customer_id") @db.Uuid
+  branchId       String?         @map("branch_id") @db.Uuid
+  type           CreditEntryType
+  /// Con signo: + acredita, − consume.
+  amountCents    BigInt          @map("amount_cents")
+  paymentId      String?         @map("payment_id") @db.Uuid
+  refundId       String?         @map("refund_id") @db.Uuid
+  saleId         String?         @map("sale_id") @db.Uuid
+  reason         String?
+  createdById    String?         @map("created_by_id") @db.Uuid
+  /// Clave única que impide duplicar el movimiento (ej. "refund:<refundId>").
+  idempotencyKey String          @unique @map("idempotency_key")
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  customer     Customer     @relation(fields: [customerId], references: [id])
+  branch       Branch?      @relation(fields: [branchId], references: [id])
+  payment      Payment?     @relation(fields: [paymentId], references: [id])
+  refund       Refund?      @relation(fields: [refundId], references: [id])
+  sale         Sale?        @relation(fields: [saleId], references: [id])
+  createdBy    User?        @relation(fields: [createdById], references: [id])
+
+  @@index([customerId, createdAt])
+  @@map("customer_credit_entries")
+}
+
+// =============================================================================
+// 8. MERCADO PAGO
+// =============================================================================
+
+/// Cuenta de Mercado Pago vinculada. Tokens y clave de webhook CIFRADOS (AES-256-GCM)
+/// con la clave de la variable de entorno; nunca se loguean ni viajan al frontend.
+model MpAccount {
+  id                  String          @id @default(uuid(7)) @db.Uuid
+  organizationId      String          @map("organization_id") @db.Uuid
+  label               String
+  /// user_id de Mercado Pago (llega en cada webhook: sirve para saber de qué cuenta es).
+  mpUserId            String          @unique @map("mp_user_id")
+  nickname            String?
+  authMethod          MpAuthMethod    @map("auth_method")
+  accessTokenEnc      String          @map("access_token_enc")
+  refreshTokenEnc     String?         @map("refresh_token_enc")
+  tokenExpiresAt      DateTime?       @map("token_expires_at") @db.Timestamptz(3)
+  publicKey           String?         @map("public_key")
+  webhookSecretEnc    String?         @map("webhook_secret_enc")
+  liveMode            Boolean         @map("live_mode")
+  status              MpAccountStatus @default(ACTIVE)
+  /// Cursor del job de sincronización de pagos.
+  paymentsSyncedUntil DateTime?       @map("payments_synced_until") @db.Timestamptz(3)
+  /// Pagos anteriores a esta fecha no entran a la bandeja de conciliación.
+  reconcileFrom       DateTime        @map("reconcile_from") @db.Timestamptz(3)
+  lastError           String?         @map("last_error")
+  lastErrorAt         DateTime?       @map("last_error_at") @db.Timestamptz(3)
+  connectedById       String?         @map("connected_by_id") @db.Uuid
+  connectedAt         DateTime        @default(now()) @map("connected_at") @db.Timestamptz(3)
+  disconnectedAt      DateTime?       @map("disconnected_at") @db.Timestamptz(3)
+  createdAt           DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization   @relation(fields: [organizationId], references: [id])
+  connectedBy  User?          @relation(fields: [connectedById], references: [id])
+  branches     Branch[]
+  terminals    MpTerminal[]
+  orders       MpOrder[]
+  payments     MpPayment[]
+  preferences  MpPreference[]
+
+  @@map("mp_accounts")
+}
+
+/// Terminal Point asignada a una sucursal. Debe estar en modo PDV para recibir órdenes.
+/// Regla de MP: cada terminal PDV necesita su propia "caja" (POS) de Mercado Pago.
+model MpTerminal {
+  id            String         @id @default(uuid(7)) @db.Uuid
+  mpAccountId   String         @map("mp_account_id") @db.Uuid
+  branchId      String?        @map("branch_id") @db.Uuid
+  /// Id de la terminal en Mercado Pago (ej. "NEWLAND_N950__N950NCB801293324").
+  externalId    String         @map("external_id")
+  label         String?
+  operatingMode MpTerminalMode @default(UNDEFINED) @map("operating_mode")
+  mpStoreId     String?        @map("mp_store_id")
+  mpPosId       String?        @map("mp_pos_id")
+  active        Boolean        @default(true)
+  lastSyncedAt  DateTime?      @map("last_synced_at") @db.Timestamptz(3)
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  account MpAccount @relation(fields: [mpAccountId], references: [id])
+  branch  Branch?   @relation(fields: [branchId], references: [id])
+  orders  MpOrder[]
+
+  @@unique([mpAccountId, externalId])
+  @@map("mp_terminals")
+}
+
+/// Orden de cobro enviada a una terminal Point (API de Orders).
+/// Cada orden tiene su cobro (Payment) en estado PENDING hasta que el webhook confirma.
+/// MP admite UNA sola orden en espera por terminal: índice parcial más abajo.
+model MpOrder {
+  id                 String        @id @default(uuid(7)) @db.Uuid
+  branchId           String        @map("branch_id") @db.Uuid
+  mpAccountId        String        @map("mp_account_id") @db.Uuid
+  terminalId         String        @map("terminal_id") @db.Uuid
+  saleId             String        @map("sale_id") @db.Uuid
+  paymentId          String        @unique @map("payment_id") @db.Uuid
+  /// Id de la orden en Mercado Pago, ej. "ORD01J…" (null hasta que MP responde).
+  externalId         String?       @unique @map("external_id")
+  /// external_reference enviado a MP. MP lo exige ÚNICO por orden (máx. 64, [A-Za-z0-9_-]),
+  /// por eso es "sale_<idVenta>_<intento>" y no el id de la venta solo.
+  externalReference  String        @unique @map("external_reference")
+  /// X-Idempotency-Key enviado a MP: reintentar la creación nunca duplica la orden.
+  idempotencyKey     String        @unique @map("idempotency_key")
+  amountCents        BigInt        @map("amount_cents")
+  /// Monto efectivamente pagado (puede diferir si la terminal agrega propina).
+  paidAmountCents    BigInt?       @map("paid_amount_cents")
+  /// Estado normalizado (pendiente, aprobado, rechazado, cancelado, expirado, reembolsado).
+  status             MpOrderStatus @default(PENDING)
+  /// Estado y detalle crudos tal como los devuelve MP (created, at_terminal, processed…).
+  mpStatus           String?       @map("mp_status")
+  mpStatusDetail     String?       @map("mp_status_detail")
+  /// Id del pago dentro de la orden ("PAY01…") y su referencia al pago clásico de MP.
+  externalPaymentId  String?       @map("external_payment_id")
+  externalPaymentRef String?       @map("external_payment_ref")
+  expiresAt          DateTime?     @map("expires_at") @db.Timestamptz(3)
+  lastPayload        Json?         @map("last_payload")
+  cancelRequestedAt  DateTime?     @map("cancel_requested_at") @db.Timestamptz(3)
+  createdById        String?       @map("created_by_id") @db.Uuid
+  lastSyncedAt       DateTime?     @map("last_synced_at") @db.Timestamptz(3)
+  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  branch    Branch     @relation(fields: [branchId], references: [id])
+  account   MpAccount  @relation(fields: [mpAccountId], references: [id])
+  terminal  MpTerminal @relation(fields: [terminalId], references: [id])
+  sale      Sale       @relation(fields: [saleId], references: [id])
+  payment   Payment    @relation(fields: [paymentId], references: [id])
+  createdBy User?      @relation(fields: [createdById], references: [id])
+
+  @@unique([terminalId], map: "mp_orders_one_pending_per_terminal", where: raw("status = 'PENDING'"))
+  @@index([status, createdAt])
+  @@index([saleId])
+  @@index([externalPaymentRef])
+  @@map("mp_orders")
+}
+
+/// Espejo de TODOS los pagos de la cuenta de MP (llegan por webhook o por el job de
+/// sincronización). La conciliación garantiza que cada pago aprobado termine vinculado
+/// a un cobro, marcado como "otro ingreso" o ignorado con motivo.
+model MpPayment {
+  id                     String               @id @default(uuid(7)) @db.Uuid
+  organizationId         String               @map("organization_id") @db.Uuid
+  mpAccountId            String               @map("mp_account_id") @db.Uuid
+  /// Id del pago en Mercado Pago.
+  externalId             String               @unique @map("external_id")
+  status                 String
+  statusDetail           String?              @map("status_detail")
+  amountCents            BigInt               @map("amount_cents")
+  netReceivedCents       BigInt?              @map("net_received_cents")
+  feeCents               BigInt?              @map("fee_cents")
+  refundedCents          BigInt               @default(0) @map("refunded_cents")
+  currencyId             String               @map("currency_id")
+  paymentMethodId        String?              @map("payment_method_id")
+  paymentTypeId          String?              @map("payment_type_id")
+  operationType          String?              @map("operation_type")
+  externalReference      String?              @map("external_reference")
+  description            String?
+  payerEmail             String?              @map("payer_email")
+  payerName              String?              @map("payer_name")
+  payerDocNumber         String?              @map("payer_doc_number")
+  pointOfInteractionType String?              @map("point_of_interaction_type")
+  /// Referencias a orden, terminal, local y caja de MP (para inferir la sucursal).
+  mpOrderRef             String?              @map("mp_order_ref")
+  mpTerminalRef          String?              @map("mp_terminal_ref")
+  mpStoreRef             String?              @map("mp_store_ref")
+  mpPosRef               String?              @map("mp_pos_ref")
+  branchId               String?              @map("branch_id") @db.Uuid
+  dateCreated            DateTime             @map("date_created") @db.Timestamptz(3)
+  dateApproved           DateTime?            @map("date_approved") @db.Timestamptz(3)
+  dateLastUpdated        DateTime             @map("date_last_updated") @db.Timestamptz(3)
+  moneyReleaseDate       DateTime?            @map("money_release_date") @db.Timestamptz(3)
+  /// Respuesta completa de MP (para auditoría y reprocesos).
+  raw                    Json
+  firstSeenVia           MpSyncSource         @map("first_seen_via")
+  reconciliationStatus   ReconciliationStatus @map("reconciliation_status")
+  reconciledById         String?              @map("reconciled_by_id") @db.Uuid
+  reconciledAt           DateTime?            @map("reconciled_at") @db.Timestamptz(3)
+  reconciliationNote     String?              @map("reconciliation_note")
+  createdAt              DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  account      MpAccount    @relation(fields: [mpAccountId], references: [id])
+  branch       Branch?      @relation(fields: [branchId], references: [id])
+  reconciledBy User?        @relation(fields: [reconciledById], references: [id])
+  payment      Payment?
+
+  @@index([organizationId, reconciliationStatus, dateCreated])
+  @@index([externalReference])
+  @@map("mp_payments")
+}
+
+/// Preferencia de Checkout Pro para cobrar una seña online.
+model MpPreference {
+  id                String   @id @default(uuid(7)) @db.Uuid
+  mpAccountId       String   @map("mp_account_id") @db.Uuid
+  appointmentId     String   @map("appointment_id") @db.Uuid
+  paymentId         String   @unique @map("payment_id") @db.Uuid
+  externalId        String   @unique @map("external_id")
+  initPoint         String   @map("init_point")
+  externalReference String   @map("external_reference")
+  expiresAt         DateTime @map("expires_at") @db.Timestamptz(3)
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  account     MpAccount   @relation(fields: [mpAccountId], references: [id])
+  appointment Appointment @relation(fields: [appointmentId], references: [id])
+  payment     Payment     @relation(fields: [paymentId], references: [id])
+
+  @@map("mp_preferences")
+}
+
+/// Bandeja de entrada de webhooks (Mercado Pago, WhatsApp, Resend). Solo se guardan
+/// los que pasaron la validación de firma. UNIQUE(provider, event_key) = idempotencia:
+/// un webhook repetido no se procesa dos veces.
+model WebhookEvent {
+  id             String             @id @default(uuid(7)) @db.Uuid
+  provider       WebhookProvider
+  eventKey       String             @map("event_key")
+  organizationId String?            @map("organization_id") @db.Uuid
+  topic          String?
+  action         String?
+  resourceId     String?            @map("resource_id")
+  /// Cuenta de origen (user_id de MP, phone_number_id de WhatsApp).
+  accountRef     String?            @map("account_ref")
+  payload        Json
+  status         WebhookEventStatus @default(RECEIVED)
+  attempts       Int                @default(0)
+  lastError      String?            @map("last_error")
+  receivedAt     DateTime           @default(now()) @map("received_at") @db.Timestamptz(3)
+  processedAt    DateTime?          @map("processed_at") @db.Timestamptz(3)
+
+  organization Organization? @relation(fields: [organizationId], references: [id])
+
+  @@unique([provider, eventKey])
+  @@index([status, receivedAt])
+  @@index([provider, resourceId])
+  @@map("webhook_events")
+}
+
+// =============================================================================
+// 9. CAJA DIARIA, EGRESOS
+// =============================================================================
+
+/// Caja de una sucursal. Solo una ABIERTA por sucursal (índice parcial único).
+/// El esperado por medio de pago se calcula: apertura + cobros − reintegros − egresos
+/// ± aportes/retiros. Al cerrar se guarda el arqueo en CashCount.
+model CashSession {
+  id               String            @id @default(uuid(7)) @db.Uuid
+  organizationId   String            @map("organization_id") @db.Uuid
+  branchId         String            @map("branch_id") @db.Uuid
+  /// Día de negocio en hora local de la sucursal.
+  businessDate     DateTime          @map("business_date") @db.Date
+  status           CashSessionStatus @default(OPEN)
+  openingCashCents BigInt            @map("opening_cash_cents")
+  openingNote      String?           @map("opening_note")
+  openedAt         DateTime          @default(now()) @map("opened_at") @db.Timestamptz(3)
+  openedById       String            @map("opened_by_id") @db.Uuid
+  closedAt         DateTime?         @map("closed_at") @db.Timestamptz(3)
+  closedById       String?           @map("closed_by_id") @db.Uuid
+  closingNote      String?           @map("closing_note")
+  createdAt        DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization   @relation(fields: [organizationId], references: [id])
+  branch       Branch         @relation(fields: [branchId], references: [id])
+  openedBy     User           @relation("CashSessionOpenedBy", fields: [openedById], references: [id])
+  closedBy     User?          @relation("CashSessionClosedBy", fields: [closedById], references: [id])
+  counts       CashCount[]
+  movements    CashMovement[]
+  payments     Payment[]
+  refunds      Refund[]
+  expenses     Expense[]
+
+  @@unique([branchId], map: "cash_sessions_one_open_per_branch", where: raw("status = 'OPEN'"))
+  @@index([branchId, businessDate])
+  @@map("cash_sessions")
+}
+
+/// Arqueo al cierre: por cada medio de pago, esperado vs contado y la diferencia.
+model CashCount {
+  id              String        @id @default(uuid(7)) @db.Uuid
+  cashSessionId   String        @map("cash_session_id") @db.Uuid
+  method          PaymentMethod
+  expectedCents   BigInt        @map("expected_cents")
+  countedCents    BigInt        @map("counted_cents")
+  differenceCents BigInt        @map("difference_cents")
+  note            String?
+
+  cashSession CashSession @relation(fields: [cashSessionId], references: [id])
+
+  @@unique([cashSessionId, method])
+  @@map("cash_counts")
+}
+
+/// Movimientos de caja que NO son ventas ni gastos: aportes (cambio inicial extra) y
+/// retiros (ej. el dueño retira efectivo). No afectan el resultado del mes.
+model CashMovement {
+  id            String           @id @default(uuid(7)) @db.Uuid
+  cashSessionId String           @map("cash_session_id") @db.Uuid
+  type          CashMovementType
+  method        PaymentMethod    @default(CASH)
+  amountCents   BigInt           @map("amount_cents")
+  description   String
+  createdById   String           @map("created_by_id") @db.Uuid
+  createdAt     DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  voidedAt      DateTime?        @map("voided_at") @db.Timestamptz(3)
+  voidedById    String?          @map("voided_by_id") @db.Uuid
+  voidReason    String?          @map("void_reason")
+
+  cashSession CashSession @relation(fields: [cashSessionId], references: [id])
+  createdBy   User        @relation("CashMovementCreatedBy", fields: [createdById], references: [id])
+  voidedBy    User?       @relation("CashMovementVoidedBy", fields: [voidedById], references: [id])
+
+  @@index([cashSessionId])
+  @@map("cash_movements")
+}
+
+model ExpenseCategory {
+  id             String  @id @default(uuid(7)) @db.Uuid
+  organizationId String  @map("organization_id") @db.Uuid
+  name           String
+  /// Categorías que usa el sistema (ej. "COMMISSIONS" al pagar una liquidación).
+  systemKey      String? @map("system_key")
+  active         Boolean @default(true)
+  sortOrder      Int     @default(0) @map("sort_order")
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  expenses     Expense[]
+
+  @@unique([organizationId, name])
+  @@unique([organizationId, systemKey])
+  @@map("expense_categories")
+}
+
+/// Egreso o gasto (insumos, alquiler, sueldos, comisiones pagadas…). Si se pagó con
+/// plata de la caja, lleva cashSessionId y descuenta del esperado.
+model Expense {
+  id                     String        @id @default(uuid(7)) @db.Uuid
+  organizationId         String        @map("organization_id") @db.Uuid
+  /// Null = gasto general de la organización (no de una sucursal).
+  branchId               String?       @map("branch_id") @db.Uuid
+  categoryId             String        @map("category_id") @db.Uuid
+  amountCents            BigInt        @map("amount_cents")
+  method                 PaymentMethod
+  occurredOn             DateTime      @map("occurred_on") @db.Date
+  description            String
+  supplier               String?
+  cashSessionId          String?       @map("cash_session_id") @db.Uuid
+  commissionSettlementId String?       @unique @map("commission_settlement_id") @db.Uuid
+  createdById            String        @map("created_by_id") @db.Uuid
+  createdAt              DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  voidedAt               DateTime?     @map("voided_at") @db.Timestamptz(3)
+  voidedById             String?       @map("voided_by_id") @db.Uuid
+  voidReason             String?       @map("void_reason")
+
+  organization         Organization          @relation(fields: [organizationId], references: [id])
+  branch               Branch?               @relation(fields: [branchId], references: [id])
+  category             ExpenseCategory       @relation(fields: [categoryId], references: [id])
+  cashSession          CashSession?          @relation(fields: [cashSessionId], references: [id])
+  commissionSettlement CommissionSettlement? @relation(fields: [commissionSettlementId], references: [id])
+  createdBy            User                  @relation("ExpenseCreatedBy", fields: [createdById], references: [id])
+  voidedBy             User?                 @relation("ExpenseVoidedBy", fields: [voidedById], references: [id])
+
+  @@index([organizationId, occurredOn])
+  @@index([branchId, occurredOn])
+  @@map("expenses")
+}
+
+// =============================================================================
+// 10. COMISIONES
+// =============================================================================
+
+/// Ledger INMUTABLE de comisiones. Se genera al pagarse la venta; si se anula, se
+/// agrega una REVERSAL negativa (si la original ya estaba liquidada, la reversa
+/// entra en la próxima liquidación).
+model CommissionEntry {
+  id              String              @id @default(uuid(7)) @db.Uuid
+  organizationId  String              @map("organization_id") @db.Uuid
+  branchId        String              @map("branch_id") @db.Uuid
+  barberId        String              @map("barber_id") @db.Uuid
+  saleId          String?             @map("sale_id") @db.Uuid
+  saleItemId      String?             @map("sale_item_id") @db.Uuid
+  kind            CommissionEntryKind
+  itemType        SaleItemType?       @map("item_type")
+  baseCents       BigInt              @map("base_cents")
+  rateBps         Int                 @map("rate_bps")
+  /// Con signo. Redondeo: al centavo, hacia abajo (regla documentada en la Fase 4).
+  amountCents     BigInt              @map("amount_cents")
+  /// Fecha que define en qué período se liquida (pago de la venta o anulación).
+  occurredAt      DateTime            @map("occurred_at") @db.Timestamptz(3)
+  reversesEntryId String?             @map("reverses_entry_id") @db.Uuid
+  reason          String?
+  createdById     String?             @map("created_by_id") @db.Uuid
+  /// Ej. "earn:<saleItemId>", "reversal:<saleItemId>". Impide duplicados.
+  idempotencyKey  String              @unique @map("idempotency_key")
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization   Organization              @relation(fields: [organizationId], references: [id])
+  branch         Branch                    @relation(fields: [branchId], references: [id])
+  barber         Barber                    @relation(fields: [barberId], references: [id])
+  sale           Sale?                     @relation(fields: [saleId], references: [id])
+  saleItem       SaleItem?                 @relation(fields: [saleItemId], references: [id])
+  reversesEntry  CommissionEntry?          @relation("CommissionReversal", fields: [reversesEntryId], references: [id])
+  reversals      CommissionEntry[]         @relation("CommissionReversal")
+  createdBy      User?                     @relation(fields: [createdById], references: [id])
+  settlementItem CommissionSettlementItem?
+
+  @@index([barberId, occurredAt])
+  @@index([organizationId, branchId, occurredAt])
+  @@map("commission_entries")
+}
+
+/// Liquidación de un barbero para un período. Al marcarla pagada se crea el egreso.
+model CommissionSettlement {
+  id             String           @id @default(uuid(7)) @db.Uuid
+  organizationId String           @map("organization_id") @db.Uuid
+  /// Null = liquidación que abarca todas las sucursales del barbero.
+  branchId       String?          @map("branch_id") @db.Uuid
+  barberId       String           @map("barber_id") @db.Uuid
+  periodType     SettlementPeriod @map("period_type")
+  periodStart    DateTime         @map("period_start") @db.Date
+  periodEnd      DateTime         @map("period_end") @db.Date
+  totalCents     BigInt           @map("total_cents")
+  status         SettlementStatus @default(DRAFT)
+  notes          String?
+  createdById    String           @map("created_by_id") @db.Uuid
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  paidAt         DateTime?        @map("paid_at") @db.Timestamptz(3)
+  paidById       String?          @map("paid_by_id") @db.Uuid
+  paymentMethod  PaymentMethod?   @map("payment_method")
+  voidedAt       DateTime?        @map("voided_at") @db.Timestamptz(3)
+  voidedById     String?          @map("voided_by_id") @db.Uuid
+  voidReason     String?          @map("void_reason")
+
+  organization Organization               @relation(fields: [organizationId], references: [id])
+  branch       Branch?                    @relation(fields: [branchId], references: [id])
+  barber       Barber                     @relation(fields: [barberId], references: [id])
+  createdBy    User                       @relation("SettlementCreatedBy", fields: [createdById], references: [id])
+  paidBy       User?                      @relation("SettlementPaidBy", fields: [paidById], references: [id])
+  voidedBy     User?                      @relation("SettlementVoidedBy", fields: [voidedById], references: [id])
+  items        CommissionSettlementItem[]
+  expense      Expense?
+
+  @@index([barberId, periodStart])
+  @@map("commission_settlements")
+}
+
+/// Qué entradas de comisión incluye cada liquidación. UNIQUE(commission_entry_id):
+/// una comisión no puede liquidarse dos veces.
+model CommissionSettlementItem {
+  settlementId      String @map("settlement_id") @db.Uuid
+  commissionEntryId String @unique @map("commission_entry_id") @db.Uuid
+
+  settlement CommissionSettlement @relation(fields: [settlementId], references: [id], onDelete: Cascade)
+  entry      CommissionEntry      @relation(fields: [commissionEntryId], references: [id])
+
+  @@id([settlementId, commissionEntryId])
+  @@map("commission_settlement_items")
+}
+
+// =============================================================================
+// 11. PUNTOS Y RECOMPENSAS
+// =============================================================================
+
+/// Ledger INMUTABLE de puntos (a nivel organización: valen en todas las sucursales).
+/// Saldo = SUM(points). Nunca se edita un número. El vencimiento se calcula con FIFO
+/// por fecha de vencimiento y se registra como fila EXPIRE.
+model PointsEntry {
+  id              String          @id @default(uuid(7)) @db.Uuid
+  organizationId  String          @map("organization_id") @db.Uuid
+  customerId      String          @map("customer_id") @db.Uuid
+  /// Sucursal donde ocurrió (para reportes).
+  branchId        String?         @map("branch_id") @db.Uuid
+  type            PointsEntryType
+  /// Con signo: + acredita, − descuenta.
+  points          Int
+  /// Solo en acreditaciones: cuándo vencen (null = no vencen).
+  expiresAt       DateTime?       @map("expires_at") @db.Timestamptz(3)
+  saleId          String?         @map("sale_id") @db.Uuid
+  reversesEntryId String?         @map("reverses_entry_id") @db.Uuid
+  /// Obligatorio en ajustes manuales (CHECK en extra.sql).
+  reason          String?
+  createdById     String?         @map("created_by_id") @db.Uuid
+  /// Ej. "earn:<saleId>", "reversal:<saleId>", "expire:<customerId>:<fecha>".
+  idempotencyKey  String          @unique @map("idempotency_key")
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization       Organization      @relation(fields: [organizationId], references: [id])
+  customer           Customer          @relation(fields: [customerId], references: [id])
+  branch             Branch?           @relation(fields: [branchId], references: [id])
+  sale               Sale?             @relation(fields: [saleId], references: [id])
+  reversesEntry      PointsEntry?      @relation("PointsReversal", fields: [reversesEntryId], references: [id])
+  reversals          PointsEntry[]     @relation("PointsReversal")
+  createdBy          User?             @relation(fields: [createdById], references: [id])
+  redemption         RewardRedemption? @relation("RedemptionPointsEntry")
+  redemptionReversal RewardRedemption? @relation("RedemptionReversalEntry")
+
+  @@index([customerId, createdAt])
+  @@index([organizationId, expiresAt])
+  @@map("points_entries")
+}
+
+/// Catálogo de recompensas canjeables con puntos.
+model Reward {
+  id                 String     @id @default(uuid(7)) @db.Uuid
+  organizationId     String     @map("organization_id") @db.Uuid
+  name               String
+  description        String?
+  type               RewardType
+  pointsCost         Int        @map("points_cost")
+  serviceId          String?    @map("service_id") @db.Uuid
+  productId          String?    @map("product_id") @db.Uuid
+  discountFixedCents BigInt?    @map("discount_fixed_cents")
+  discountPercentBps Int?       @map("discount_percent_bps")
+  active             Boolean    @default(true)
+  validFrom          DateTime?  @map("valid_from") @db.Timestamptz(3)
+  validUntil         DateTime?  @map("valid_until") @db.Timestamptz(3)
+  sortOrder          Int        @default(0) @map("sort_order")
+  archivedAt         DateTime?  @map("archived_at") @db.Timestamptz(3)
+  createdAt          DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization       @relation(fields: [organizationId], references: [id])
+  service      Service?           @relation(fields: [serviceId], references: [id])
+  product      Product?           @relation(fields: [productId], references: [id])
+  redemptions  RewardRedemption[]
+
+  @@index([organizationId, active])
+  @@map("rewards")
+}
+
+/// Canje de una recompensa en el cobro. Descuenta puntos (PointsEntry REDEEM) y
+/// aplica el descuento en una línea de la venta.
+model RewardRedemption {
+  id              String           @id @default(uuid(7)) @db.Uuid
+  organizationId  String           @map("organization_id") @db.Uuid
+  branchId        String           @map("branch_id") @db.Uuid
+  customerId      String           @map("customer_id") @db.Uuid
+  rewardId        String           @map("reward_id") @db.Uuid
+  saleId          String           @map("sale_id") @db.Uuid
+  saleItemId      String?          @unique @map("sale_item_id") @db.Uuid
+  pointsSpent     Int              @map("points_spent")
+  /// Descuento que efectivamente aplicó el canje: es lo que se devuelve al deshacerlo.
+  discountCents   BigInt           @default(0) @map("discount_cents")
+  pointsEntryId   String           @unique @map("points_entry_id") @db.Uuid
+  status          RedemptionStatus @default(APPLIED)
+  reversalEntryId String?          @unique @map("reversal_entry_id") @db.Uuid
+  redeemedById    String?          @map("redeemed_by_id") @db.Uuid
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  reversedAt      DateTime?        @map("reversed_at") @db.Timestamptz(3)
+
+  organization  Organization @relation(fields: [organizationId], references: [id])
+  branch        Branch       @relation(fields: [branchId], references: [id])
+  customer      Customer     @relation(fields: [customerId], references: [id])
+  reward        Reward       @relation(fields: [rewardId], references: [id])
+  sale          Sale         @relation(fields: [saleId], references: [id])
+  saleItem      SaleItem?    @relation(fields: [saleItemId], references: [id])
+  pointsEntry   PointsEntry  @relation("RedemptionPointsEntry", fields: [pointsEntryId], references: [id])
+  reversalEntry PointsEntry? @relation("RedemptionReversalEntry", fields: [reversalEntryId], references: [id])
+  redeemedBy    User?        @relation(fields: [redeemedById], references: [id])
+
+  @@index([customerId, createdAt])
+  @@map("reward_redemptions")
+}
+
+// =============================================================================
+// 12. NOTIFICACIONES
+// =============================================================================
+
+/// Configuración por tipo de mensaje: activo o no, y nombre de plantilla de WhatsApp
+/// aprobada por Meta. Sin plantilla → ese mensaje sale por email.
+model NotificationTypeSetting {
+  organizationId           String           @map("organization_id") @db.Uuid
+  type                     NotificationType
+  enabled                  Boolean          @default(true)
+  whatsappTemplateName     String?          @map("whatsapp_template_name")
+  whatsappTemplateLanguage String           @default("es_AR") @map("whatsapp_template_language")
+  updatedAt                DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@id([organizationId, type])
+  @@map("notification_type_settings")
+}
+
+/// Cada envío (o intento). Funciona como "bandeja de salida": se crea en la misma
+/// transacción que el hecho de negocio y el worker la despacha. dedupeKey UNIQUE
+/// impide mandar dos veces el mismo recordatorio. Si WhatsApp falla, se crea una
+/// nueva fila por email con fallbackOfId apuntando a la fallida.
+model Notification {
+  id                String              @id @default(uuid(7)) @db.Uuid
+  organizationId    String              @map("organization_id") @db.Uuid
+  branchId          String?             @map("branch_id") @db.Uuid
+  customerId        String?             @map("customer_id") @db.Uuid
+  /// Destinatario staff (invitaciones, recuperación de contraseña).
+  userId            String?             @map("user_id") @db.Uuid
+  appointmentId     String?             @map("appointment_id") @db.Uuid
+  saleId            String?             @map("sale_id") @db.Uuid
+  type              NotificationType
+  channel           NotificationChannel
+  status            NotificationStatus  @default(PENDING)
+  /// Email o teléfono E.164 al momento del envío.
+  recipient         String
+  /// Ej. "reminder:<appointmentId>:1440".
+  dedupeKey         String              @unique @map("dedupe_key")
+  templateName      String?             @map("template_name")
+  /// Variables de la plantilla. Nunca secretos (el código de login no se guarda).
+  payload           Json
+  scheduledFor      DateTime            @default(now()) @map("scheduled_for") @db.Timestamptz(3)
+  attempts          Int                 @default(0)
+  lastError         String?             @map("last_error")
+  providerMessageId String?             @map("provider_message_id")
+  fallbackOfId      String?             @unique @map("fallback_of_id") @db.Uuid
+  skippedReason     String?             @map("skipped_reason")
+  enqueuedAt        DateTime?           @map("enqueued_at") @db.Timestamptz(3)
+  sentAt            DateTime?           @map("sent_at") @db.Timestamptz(3)
+  deliveredAt       DateTime?           @map("delivered_at") @db.Timestamptz(3)
+  readAt            DateTime?           @map("read_at") @db.Timestamptz(3)
+  failedAt          DateTime?           @map("failed_at") @db.Timestamptz(3)
+  createdAt         DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  branch       Branch?       @relation(fields: [branchId], references: [id])
+  customer     Customer?     @relation(fields: [customerId], references: [id])
+  user         User?         @relation(fields: [userId], references: [id])
+  appointment  Appointment?  @relation(fields: [appointmentId], references: [id])
+  sale         Sale?         @relation(fields: [saleId], references: [id])
+  fallbackOf   Notification? @relation("NotificationFallback", fields: [fallbackOfId], references: [id])
+  fallback     Notification? @relation("NotificationFallback")
+
+  @@index([status, scheduledFor])
+  @@index([customerId, type, createdAt])
+  @@index([providerMessageId])
+  @@map("notifications")
+}
+
+// =============================================================================
+// 13. AUDITORÍA, SALUD DEL SISTEMA E IDEMPOTENCIA DE LA API
+// =============================================================================
+
+/// Auditoría INMUTABLE de acciones sensibles (stock, puntos, precios, anulaciones,
+/// cierres de caja, conciliación, accesos y configuración).
+model AuditLog {
+  id              String      @id @default(uuid(7)) @db.Uuid
+  organizationId  String?     @map("organization_id") @db.Uuid
+  branchId        String?     @map("branch_id") @db.Uuid
+  actorType       ActorType   @map("actor_type")
+  actorUserId     String?     @map("actor_user_id") @db.Uuid
+  actorCustomerId String?     @map("actor_customer_id") @db.Uuid
+  action          AuditAction
+  entityType      String      @map("entity_type")
+  entityId        String?     @map("entity_id")
+  summary         String?
+  before          Json?
+  after           Json?
+  reason          String?
+  ipAddress       String?     @map("ip_address")
+  userAgent       String?     @map("user_agent")
+  requestId       String?     @map("request_id")
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization  Organization? @relation(fields: [organizationId], references: [id])
+  branch        Branch?       @relation(fields: [branchId], references: [id])
+  actorUser     User?         @relation(fields: [actorUserId], references: [id])
+  actorCustomer Customer?     @relation(fields: [actorCustomerId], references: [id])
+
+  @@index([organizationId, createdAt])
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}
+
+/// Alertas visibles en el dashboard (worker caído, colas trabadas, sync de MP fallando…).
+/// Una sola alerta ABIERTA por dedupeKey (índice parcial único).
+model SystemAlert {
+  id               String          @id @default(uuid(7)) @db.Uuid
+  organizationId   String?         @map("organization_id") @db.Uuid
+  kind             SystemAlertKind
+  severity         AlertSeverity
+  dedupeKey        String          @map("dedupe_key")
+  message          String
+  details          Json?
+  firstSeenAt      DateTime        @default(now()) @map("first_seen_at") @db.Timestamptz(3)
+  lastSeenAt       DateTime        @default(now()) @map("last_seen_at") @db.Timestamptz(3)
+  occurrences      Int             @default(1)
+  resolvedAt       DateTime?       @map("resolved_at") @db.Timestamptz(3)
+  acknowledgedAt   DateTime?       @map("acknowledged_at") @db.Timestamptz(3)
+  acknowledgedById String?         @map("acknowledged_by_id") @db.Uuid
+
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  acknowledgedBy User?         @relation(fields: [acknowledgedById], references: [id])
+
+  @@unique([dedupeKey], map: "system_alerts_one_open_per_key", where: raw("resolved_at IS NULL"))
+  @@index([resolvedAt, severity])
+  @@map("system_alerts")
+}
+
+/// Latido del worker (cada 30 s). Si se atrasa, la API muestra "worker caído".
+model WorkerHeartbeat {
+  /// Id de la instancia (hostname + pid).
+  id         String    @id
+  version    String?
+  startedAt  DateTime  @map("started_at") @db.Timestamptz(3)
+  lastBeatAt DateTime  @map("last_beat_at") @db.Timestamptz(3)
+  stoppedAt  DateTime? @map("stopped_at") @db.Timestamptz(3)
+
+  @@map("worker_heartbeats")
+}
+
+/// Historial de ejecuciones de jobs programados (sync de MP, recordatorios, vencimientos…).
+model JobRun {
+  id          String       @id @default(uuid(7)) @db.Uuid
+  jobName     String       @map("job_name")
+  schedulerId String?      @map("scheduler_id")
+  status      JobRunStatus
+  startedAt   DateTime     @default(now()) @map("started_at") @db.Timestamptz(3)
+  finishedAt  DateTime?    @map("finished_at") @db.Timestamptz(3)
+  stats       Json?
+  error       String?
+
+  @@index([jobName, startedAt])
+  @@map("job_runs")
+}
+
+/// Idempotencia de la API: operaciones de dinero (cobrar, crear venta, pagar liquidación)
+/// aceptan un header Idempotency-Key. Un doble clic o un reintento devuelve la misma
+/// respuesta en vez de duplicar.
+model ApiIdempotencyKey {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  /// Actor + ruta, ej. "user:<id>:POST /v1/sales/:id/payments".
+  scope          String
+  key            String
+  requestHash    String   @map("request_hash")
+  responseStatus Int?     @map("response_status")
+  responseBody   Json?    @map("response_body")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  expiresAt      DateTime @map("expires_at") @db.Timestamptz(3)
+
+  @@unique([scope, key])
+  @@index([expiresAt])
+  @@map("api_idempotency_keys")
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+/// Los barberos NO son usuarios (decisión del 25/09/2026): son perfiles `Barber` sin acceso.
+/// RECEPTION: agenda, clientes y cobro; sin finanzas, reportes ni configuración.
+enum MemberRole {
+  ADMIN
+  RECEPTION
+
+  @@map("member_role")
+}
+
+enum TwoFactorMethod {
+  NONE
+  EMAIL_CODE
+
+  @@map("two_factor_method")
+}
+
+enum SessionKind {
+  STAFF
+  CUSTOMER
+
+  @@map("session_kind")
+}
+
+enum AuthCodePurpose {
+  CUSTOMER_LOGIN
+  STAFF_SECOND_FACTOR
+  STAFF_PASSWORD_RESET
+  STAFF_INVITATION
+
+  @@map("auth_code_purpose")
+}
+
+enum ActorType {
+  STAFF
+  CUSTOMER
+  SYSTEM
+
+  @@map("actor_type")
+}
+
+enum CustomerSource {
+  IN_STORE
+  ONLINE_BOOKING
+  IMPORT
+
+  @@map("customer_source")
+}
+
+enum NotificationChannel {
+  EMAIL
+  WHATSAPP
+
+  @@map("notification_channel")
+}
+
+/// TRANSACTIONAL: confirmaciones, recordatorios, cancelaciones, puntos.
+/// MARKETING: reactivación y pedido de reseña.
+enum ConsentScope {
+  TRANSACTIONAL
+  MARKETING
+
+  @@map("consent_scope")
+}
+
+enum ConsentSource {
+  IN_STORE
+  BOOKING_PAGE
+  CUSTOMER_PORTAL
+  WHATSAPP_REPLY
+  EMAIL_LINK
+  STAFF_UPDATE
+  IMPORT
+
+  @@map("consent_source")
+}
+
+enum TimeOffType {
+  VACATION
+  BREAK
+  SICK_LEAVE
+  PERSONAL
+  TRAINING
+  OTHER
+
+  @@map("time_off_type")
+}
+
+enum DepositMode {
+  NONE
+  FIXED
+  PERCENT
+
+  @@map("deposit_mode")
+}
+
+/// Qué pasa con la seña si el cliente cancela a tiempo.
+enum DepositRefundPolicy {
+  REFUND
+  CUSTOMER_CREDIT
+
+  @@map("deposit_refund_policy")
+}
+
+enum RewardCommissionBase {
+  LIST_PRICE
+  CHARGED_AMOUNT
+
+  @@map("reward_commission_base")
+}
+
+/// PENDING_PAYMENT = esperando la seña (retiene el horario hasta holdExpiresAt).
+enum AppointmentStatus {
+  PENDING_PAYMENT
+  BOOKED
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELED
+  NO_SHOW
+
+  @@map("appointment_status")
+}
+
+enum AppointmentSource {
+  ONLINE
+  STAFF
+  WALK_IN
+
+  @@map("appointment_source")
+}
+
+enum ConfirmationSource {
+  DEPOSIT_PAID
+  CUSTOMER_LINK
+  WHATSAPP_REPLY
+  STAFF
+
+  @@map("confirmation_source")
+}
+
+enum CancelReason {
+  CUSTOMER_REQUEST
+  STAFF_DECISION
+  PAYMENT_TIMEOUT
+  BARBER_UNAVAILABLE
+  DUPLICATE
+  OTHER
+
+  @@map("cancel_reason")
+}
+
+enum DepositStatus {
+  NOT_REQUIRED
+  PENDING
+  PAID
+  APPLIED
+  REFUNDED
+  CREDITED
+  RETAINED
+  EXPIRED
+
+  @@map("deposit_status")
+}
+
+enum AppointmentEventType {
+  CREATED
+  STATUS_CHANGED
+  RESCHEDULED
+  REASSIGNED
+  UPDATED
+
+  @@map("appointment_event_type")
+}
+
+enum SaleStatus {
+  OPEN
+  PAID
+  VOIDED
+
+  @@map("sale_status")
+}
+
+enum SaleItemType {
+  SERVICE
+  PRODUCT
+  TIP
+
+  @@map("sale_item_type")
+}
+
+enum PaymentPurpose {
+  SALE
+  DEPOSIT
+  CUSTOMER_CREDIT
+  OTHER_INCOME
+
+  @@map("payment_purpose")
+}
+
+/// MP_POINT: con Point (integrado por API de Orders o cargado a mano si falla la integración).
+/// MP_CHECKOUT: seña online. MP_OTHER: pago de la cuenta MP asignado desde la bandeja
+/// (QR, transferencia a la cuenta, link). CUSTOMER_CREDIT: uso de saldo a favor (no es plata nueva).
+enum PaymentMethod {
+  CASH
+  TRANSFER
+  MP_POINT
+  MP_CHECKOUT
+  MP_OTHER
+  CUSTOMER_CREDIT
+  OTHER
+
+  @@map("payment_method")
+}
+
+enum PaymentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELED
+  EXPIRED
+  REFUNDED
+  PARTIALLY_REFUNDED
+
+  @@map("payment_status")
+}
+
+enum RefundDestination {
+  ORIGINAL_METHOD
+  CUSTOMER_CREDIT
+
+  @@map("refund_destination")
+}
+
+enum RefundStatus {
+  PENDING
+  APPROVED
+  FAILED
+
+  @@map("refund_status")
+}
+
+enum CreditEntryType {
+  TOPUP
+  REFUND_TO_CREDIT
+  SPENT
+  ADJUSTMENT
+  REVERSAL
+
+  @@map("credit_entry_type")
+}
+
+enum MpAuthMethod {
+  MANUAL_TOKEN
+  OAUTH
+
+  @@map("mp_auth_method")
+}
+
+enum MpAccountStatus {
+  ACTIVE
+  ERROR
+  DISCONNECTED
+
+  @@map("mp_account_status")
+}
+
+/// Valores tal como los devuelve GET /terminals/v1/list.
+enum MpTerminalMode {
+  PDV
+  STANDALONE
+  UNDEFINED
+
+  @@map("mp_terminal_mode")
+}
+
+/// Estado normalizado de la orden Point (el crudo queda en mp_status).
+enum MpOrderStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELED
+  EXPIRED
+  REFUNDED
+
+  @@map("mp_order_status")
+}
+
+enum MpSyncSource {
+  WEBHOOK
+  SYNC_JOB
+  ORDER_FETCH
+
+  @@map("mp_sync_source")
+}
+
+enum ReconciliationStatus {
+  /// Tenía external_reference nuestro y se vinculó solo.
+  AUTO_MATCHED
+  /// En la bandeja "Pagos sin asignar".
+  UNASSIGNED
+  MANUALLY_ASSIGNED
+  OTHER_INCOME
+  IGNORED
+  /// Rechazados, anteriores a reconcileFrom, etc.
+  NOT_APPLICABLE
+
+  @@map("reconciliation_status")
+}
+
+enum WebhookProvider {
+  MERCADOPAGO
+  WHATSAPP
+  RESEND
+
+  @@map("webhook_provider")
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+  IGNORED
+
+  @@map("webhook_event_status")
+}
+
+enum CashSessionStatus {
+  OPEN
+  CLOSED
+
+  @@map("cash_session_status")
+}
+
+enum CashMovementType {
+  CONTRIBUTION
+  WITHDRAWAL
+
+  @@map("cash_movement_type")
+}
+
+enum StockMovementType {
+  INITIAL
+  PURCHASE
+  SALE
+  SALE_VOID
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+  INTERNAL_USE
+  TRANSFER_IN
+  TRANSFER_OUT
+
+  @@map("stock_movement_type")
+}
+
+enum CommissionEntryKind {
+  EARNED
+  REVERSAL
+  ADJUSTMENT
+
+  @@map("commission_entry_kind")
+}
+
+enum SettlementPeriod {
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+  CUSTOM
+
+  @@map("settlement_period")
+}
+
+enum SettlementStatus {
+  DRAFT
+  PAID
+  VOIDED
+
+  @@map("settlement_status")
+}
+
+enum PointsEntryType {
+  EARN
+  REDEEM
+  EXPIRE
+  ADJUST
+  REVERSAL
+
+  @@map("points_entry_type")
+}
+
+enum RewardType {
+  FREE_SERVICE
+  FREE_PRODUCT
+  FIXED_DISCOUNT
+  PERCENT_DISCOUNT
+
+  @@map("reward_type")
+}
+
+enum RedemptionStatus {
+  APPLIED
+  REVERSED
+
+  @@map("redemption_status")
+}
+
+enum NotificationType {
+  LOGIN_CODE
+  BOOKING_CONFIRMATION
+  BOOKING_REMINDER
+  BOOKING_RESCHEDULED
+  BOOKING_CANCELLATION
+  DEPOSIT_PAYMENT_LINK
+  DEPOSIT_REFUNDED
+  POINTS_CREDITED
+  REWARD_AVAILABLE
+  REACTIVATION
+  REVIEW_REQUEST
+  STAFF_INVITATION
+  STAFF_PASSWORD_RESET
+  STAFF_SECOND_FACTOR
+
+  @@map("notification_type")
+}
+
+enum NotificationStatus {
+  PENDING
+  SENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  SKIPPED
+  CANCELED
+
+  @@map("notification_status")
+}
+
+enum AuditAction {
+  STAFF_INVITED
+  STAFF_ROLE_CHANGED
+  STAFF_BRANCH_ACCESS_CHANGED
+  STAFF_DEACTIVATED
+  STAFF_PASSWORD_RESET
+  SETTINGS_CHANGED
+  SERVICE_PRICE_CHANGED
+  PRODUCT_PRICE_CHANGED
+  COMMISSION_RATE_CHANGED
+  STOCK_ADJUSTED
+  STOCK_PURCHASE_RECORDED
+  POINTS_ADJUSTED
+  CREDIT_ADJUSTED
+  SALE_DISCOUNT_APPLIED
+  SALE_PRICE_OVERRIDDEN
+  SALE_VOIDED
+  PAYMENT_REFUNDED
+  CASH_SESSION_OPENED
+  CASH_SESSION_CLOSED
+  CASH_MOVEMENT_VOIDED
+  EXPENSE_VOIDED
+  COMMISSION_SETTLEMENT_PAID
+  COMMISSION_SETTLEMENT_VOIDED
+  MP_ACCOUNT_CONNECTED
+  MP_ACCOUNT_DISCONNECTED
+  MP_TERMINAL_ASSIGNED
+  MP_ORDER_CANCELED
+  MP_PAYMENT_RECONCILED
+  APPOINTMENT_NO_SHOW_REVERTED
+  CUSTOMER_MERGED
+  CUSTOMER_ANONYMIZED
+  CUSTOMER_BOOKING_BLOCKED
+  DATA_EXPORTED
+
+  @@map("audit_action")
+}
+
+enum SystemAlertKind {
+  WORKER_DOWN
+  QUEUE_BACKLOG
+  JOB_STUCK
+  JOB_FAILURES
+  WEBHOOK_SIGNATURE_INVALID
+  WEBHOOK_PROCESSING_FAILED
+  MP_SYNC_FAILING
+  MP_CREDENTIALS_INVALID
+  MP_ORDER_UNRESOLVED
+  LATE_DEPOSIT_PAYMENT
+  NOTIFICATION_FAILURES
+  NEGATIVE_STOCK
+
+  @@map("system_alert_kind")
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+
+  @@map("alert_severity")
+}
+
+enum JobRunStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+
+  @@map("job_run_status")
+}

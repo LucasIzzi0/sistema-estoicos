@@ -1,0 +1,32 @@
+{
+  "name": "estoicos",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.6.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "postinstall": "pnpm --filter @estoicos/db generate",
+    "dev": "pnpm --parallel --filter @estoicos/api --filter @estoicos/worker --filter @estoicos/web dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "test": "pnpm -r --workspace-concurrency=1 test",
+    "db:generate": "pnpm --filter @estoicos/db generate",
+    "db:migrate": "pnpm --filter @estoicos/db migrate:dev",
+    "db:deploy": "pnpm --filter @estoicos/db migrate:deploy",
+    "db:seed": "pnpm --filter @estoicos/db seed",
+    "db:studio": "pnpm --filter @estoicos/db studio"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.13.6",
+    "eslint": "10.11.0",
+    "globals": "17.12.0",
+    "prettier": "3.9.9",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.70.1"
+  }
+}

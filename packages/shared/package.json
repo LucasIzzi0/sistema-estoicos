@@ -1,0 +1,22 @@
+{
+  "name": "@estoicos/shared",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "libphonenumber-js": "1.13.14",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@estoicos/config": "workspace:*",
+    "vitest": "5.0.2"
+  }
+}

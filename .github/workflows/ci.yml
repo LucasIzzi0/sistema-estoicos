@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: estoicos
+          POSTGRES_PASSWORD: estoicos
+          POSTGRES_DB: estoicos_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U estoicos" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+
+    env:
+      APP_ENV: test
+      DEFAULT_ORGANIZATION_SLUG: estoicos
+      APP_PUBLIC_URL: http://localhost:3000
+      DATABASE_URL: postgresql://estoicos:estoicos@localhost:5432/estoicos_test
+      DATABASE_URL_TEST: postgresql://estoicos:estoicos@localhost:5432/estoicos_test
+      REDIS_URL: redis://localhost:6379/0
+      REDIS_URL_TEST: redis://localhost:6379/1
+      # Secretos de prueba (no son reales).
+      AUTH_CODE_SECRET: ci-auth-code-secret-0123456789abcdef0123456789
+      DATA_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+      EMAIL_FROM: 'Estoicos <turnos@mail.estoicos.test>'
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm --filter @estoicos/web build

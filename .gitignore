@@ -1,0 +1,20 @@
+node_modules/
+.pnpm.nosync/
+*.nosync/
+dist/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+.turbo/
+
+# Entorno: nunca se commitean secretos
+.env
+.env.*
+!.env.example
+
+# Prisma: cliente generado
+packages/db/src/generated/
+
+.DS_Store
+*.log
