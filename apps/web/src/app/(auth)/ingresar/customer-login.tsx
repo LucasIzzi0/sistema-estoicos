@@ -1,6 +1,7 @@
 'use client';
 
 import type { CustomerMe } from '@estoicos/shared';
+import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useState } from 'react';
 import { EmailCodeForm } from '@/components/auth/email-code-form';
@@ -57,6 +58,12 @@ export function CustomerLogin() {
             customer.needsProfile ? setStep({ name: 'profile', me: customer }) : finish()
           }
         />
+        <p className="mt-5 text-center text-sm text-muted-foreground">
+          ¿Sos parte del equipo?{' '}
+          <Link href="/staff/ingresar" className="font-medium text-foreground underline underline-offset-4">
+            Ingresá al panel
+          </Link>
+        </p>
       </CardContent>
     </Card>
   );

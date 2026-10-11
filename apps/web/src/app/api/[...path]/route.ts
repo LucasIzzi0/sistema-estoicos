@@ -35,11 +35,19 @@ async function forward(request: NextRequest, context: { params: Promise<{ path: 
 
   // CSRF: una mutación tiene que venir de esta misma web.
   const origin = request.headers.get('origin');
-  if (!['GET', 'HEAD'].includes(request.method) && origin && origin !== request.nextUrl.origin) {
-    return NextResponse.json(
-      { error: { code: 'FORBIDDEN', message: 'Origen no permitido.' } },
-      { status: 403 },
-    );
+  if (!['GET', 'HEAD'].includes(request.method) && origin) {
+    let originMatchesApp = false;
+    try {
+      originMatchesApp = new URL(origin).origin === new URL(serverEnv.appPublicUrl).origin;
+    } catch {
+      originMatchesApp = false;
+    }
+    if (!originMatchesApp) {
+      return NextResponse.json(
+        { error: { code: 'FORBIDDEN', message: 'Origen no permitido.' } },
+        { status: 403 },
+      );
+    }
   }
 
   const headers = new Headers();

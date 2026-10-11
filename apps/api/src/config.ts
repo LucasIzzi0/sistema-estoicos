@@ -64,9 +64,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): ApiConfig {
   const env = parsed.data;
   const isProduction = env.APP_ENV === 'production' || env.APP_ENV === 'staging';
   if (isProduction) {
-    const missing = (['RESEND_API_KEY', 'INTERNAL_API_SECRET', 'CLOUDFLARE_ORIGIN_SECRET'] as const).filter(
-      (k) => !env[k],
-    );
+    const missing = (['INTERNAL_API_SECRET', 'CLOUDFLARE_ORIGIN_SECRET'] as const).filter((k) => !env[k]);
     if (missing.length)
       throw new Error(`Faltan variables obligatorias en ${env.APP_ENV}: ${missing.join(', ')}`);
   }

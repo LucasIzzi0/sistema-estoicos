@@ -5,8 +5,8 @@ import type { CoreDeps } from '@estoicos/core';
 import { createDb } from '@estoicos/db';
 import {
   CloudApiWhatsApp,
-  ConsoleMailer,
   createEncryptor,
+  EmailSendError,
   FakeMercadoPago,
   FakeWhatsApp,
   ResendMailer,
@@ -34,7 +34,12 @@ const redis = createRedisConnection(env.REDIS_URL, 'producer');
 const queues = ALL_QUEUES.map((name) => createQueue(name, redis));
 const mailer = env.RESEND_API_KEY
   ? new ResendMailer(env.RESEND_API_KEY, env.EMAIL_FROM)
-  : new ConsoleMailer();
+  : {
+      name: 'unavailable',
+      async send() {
+        throw new EmailSendError('Envío de email desactivado: configurá RESEND_API_KEY para habilitarlo.', 503, false);
+      },
+    };
 
 // Sin credenciales de Mercado Pago se usa el simulador (solo fuera de producción).
 const simulatedMp = env.APP_ENV !== 'production' && env.MP_SIMULATED;
@@ -114,9 +119,7 @@ const app = await buildApp({
 });
 deps.log = app.log;
 
-if (mailer instanceof ConsoleMailer) {
-  app.log.warn('RESEND_API_KEY vacío: los emails se muestran en esta consola (solo desarrollo).');
-}
+if (!env.RESEND_API_KEY) app.log.warn('RESEND_API_KEY vacío: los emails están desactivados.');
 
 let closing = false;
 async function shutdown(signal: string) {
